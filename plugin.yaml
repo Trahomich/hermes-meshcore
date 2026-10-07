@@ -1,0 +1,42 @@
+name: meshcore-platform
+label: meshcore
+kind: platform
+version: 1.0.0
+description: >
+  MeshCore (LoRa mesh) gateway adapter for Hermes Agent. Connects to a
+  MeshCore companion radio node over TCP using the `meshcore` Python
+  library, answers private messages from mesh contacts, and sends replies
+  hard-truncated to a strict character limit (default 130 — LoRa airtime
+  is precious). Includes automatic reconnection with backoff, replies to
+  unknown senders via raw pubkey prefix, and standalone cron delivery.
+author: Trahomich
+requires_env:
+  - name: MESHCORE_HOST
+    description: "Companion node TCP host (e.g. 192.168.99.23)"
+    prompt: "MeshCore companion node host"
+    password: false
+optional_env:
+  - name: MESHCORE_PORT
+    description: "Companion node TCP port (default 5000)"
+    prompt: "MeshCore companion port"
+    password: false
+  - name: MESHCORE_REPLY_LIMIT
+    description: "Hard reply length limit in characters (default 130)"
+    prompt: "Reply character limit"
+    password: false
+  - name: MESHCORE_ALLOWED_USERS
+    description: "Comma-separated contact names allowed to talk to the bot"
+    prompt: "Allowed contacts (comma-separated)"
+    password: false
+  - name: MESHCORE_ALLOW_ALL_USERS
+    description: "Allow any contact to talk to the bot (public bot; disables allowlist)"
+    prompt: "Allow all contacts? (true/false)"
+    password: false
+  - name: MESHCORE_HOME_CHANNEL
+    description: "Contact name for cron / notification delivery"
+    prompt: "Home channel contact name (or empty)"
+    password: false
+  - name: MESHCORE_HOME_CHANNEL_NAME
+    description: "Human label for the home channel"
+    prompt: "Home channel display name (or empty)"
+    password: false
