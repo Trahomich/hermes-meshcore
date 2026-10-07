@@ -54,8 +54,8 @@ DEFAULT_REPLY_LIMIT = 130  # жесткий лимит ответов бота (
 # Публичный бот: служебные уведомления hermes (фоновые задачи, статусы,
 # [IMPORTANT:]-вставки, ♻️ Recovered reply от delivery ledger) не должны
 # попадать в эфир — фильтруем на входе в send
-_SERVICE_MARKERS = ("Фоновая задача", "Recovered reply")
-_SERVICE_PREFIXES = ("[IMPORTANT:", "✅ Фоновая", "❌ Фоновая", "🔄 Фоновая", "♻️")
+_SERVICE_MARKERS = ("Фоновая задача", "Recovered reply", "Прерываю текущую задачу")
+_SERVICE_PREFIXES = ("[IMPORTANT:", "✅ Фоновая", "❌ Фоновая", "🔄 Фоновая", "♻️", "⚡", "⚡️")
 
 
 def _is_service_message(text: str) -> bool:
