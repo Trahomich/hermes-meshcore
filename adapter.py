@@ -51,10 +51,15 @@ DEFAULT_HOST = "192.168.99.23"
 DEFAULT_PORT = 5000
 DEFAULT_REPLY_LIMIT = 130  # жесткий лимит ответов бота (символы)
 RECONNECT_BACKOFF = [1, 2, 5, 15, 30]
-KEEPALIVE_CHECK_SECONDS = 15.0  # период проверки mc.is_connected
+KEEPALIVE_CHECK_SECONDS = 15.0  # период проверки dropped-события
 RECONNECT_WAIT_SECONDS = 15.0  # сколько send() ждёт реконнекта при обрыве
 SEND_TIMEOUT_SECONDS = 60.0  # LoRa медленный: MSG_SENT может идти десятки секунд
 CONTACT_CONNECT_ATTEMPTS = 3  # companion TCP отдаёт контакты через раз — ретраим соединением
+# Нода (fw v1.17.1) шлёт уведомление MESSAGES_WAITING только самому свежему
+# подключившемуся TCP-клиенту. Любой посторонний клиент (CLI-запрос, standalone
+# send) перехватывает слот. Плановая ротация соединения возвращает слот адаптеру.
+RESLOT_INTERVAL_SECONDS = 60.0
+DRAIN_MAX_MESSAGES = 50  # лимит принудительной выгрузки при подключении
 
 
 async def _connect_with_contacts(host: str, port: int) -> "MeshCore":
@@ -144,9 +149,11 @@ class MeshcoreAdapter(BasePlatformAdapter):
         backoff_idx = 0
         session_start = 0.0
         while self._running:
+            planned_rotation = False
             try:
                 session_start = time.monotonic()
                 await self._session()
+                planned_rotation = True  # нормальный выход из _session = плановая ротация
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -155,6 +162,10 @@ class MeshcoreAdapter(BasePlatformAdapter):
                 logger.warning("[%s] Session error: %s", self.name, e)
             if not self._running:
                 return
+            if planned_rotation:
+                # ротация слота уведомлений — переподключаемся без задержки
+                backoff_idx = 0
+                continue
             # сессия жила стабильно — сбрасываем backoff
             if time.monotonic() - session_start >= 30.0:
                 backoff_idx = 0
@@ -179,6 +190,14 @@ class MeshcoreAdapter(BasePlatformAdapter):
             dropped = asyncio.Event()
             mc.subscribe(EventType.DISCONNECTED, lambda _ev: dropped.set())
             await mc.start_auto_message_fetching()
+            # Полный дрейн: lib при подписке забирает только одно сообщение,
+            # а уведомление о накопившихся мог уйти другому/ушедшему клиенту
+            with suppress(Exception):
+                for _ in range(DRAIN_MAX_MESSAGES):
+                    ev = await mc.commands.get_msg(timeout=10)
+                    if ev is None or ev.type in (EventType.NO_MORE_MSGS, EventType.ERROR):
+                        break
+                    await asyncio.sleep(0.1)
             node_name = (mc.self_info or {}).get("name") or "?"
             n_contacts = len(getattr(mc, "contacts", {}) or {})
             logger.info(
@@ -186,12 +205,13 @@ class MeshcoreAdapter(BasePlatformAdapter):
                 self.name, node_name, self._host, self._port, n_contacts)
             # ВАЖНО: mc.is_connected у meshcore 2.3.15 на TCP-транспорте всегда
             # False даже на живом соединении — не использовать как признак жизни.
-            # Живём до события DISCONNECTED от библиотеки.
+            # Живём до события DISCONNECTED; плановая ротация — по таймеру RESLOT.
+            session_deadline = time.monotonic() + RESLOT_INTERVAL_SECONDS
             while self._running:
                 sleep_task = asyncio.create_task(asyncio.sleep(KEEPALIVE_CHECK_SECONDS))
                 drop_task = asyncio.create_task(dropped.wait())
                 try:
-                    _done, pending = await asyncio.wait(
+                    _done, _pending = await asyncio.wait(
                         {sleep_task, drop_task}, return_when=asyncio.FIRST_COMPLETED)
                 finally:
                     for task in (sleep_task, drop_task):
@@ -200,6 +220,9 @@ class MeshcoreAdapter(BasePlatformAdapter):
                     return
                 if drop_task in _done and dropped.is_set():
                     raise ConnectionError("companion TCP connection lost")
+                if time.monotonic() >= session_deadline:
+                    logger.debug("[%s] Planned reslot reconnect", self.name)
+                    return  # плановая ротация: _run_loop переподключится сразу
         finally:
             self._mc = None
             with suppress(Exception):
