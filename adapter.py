@@ -50,6 +50,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "192.168.99.23"
 DEFAULT_PORT = 5000
 DEFAULT_REPLY_LIMIT = 130  # жесткий лимит ответов бота (символы)
+# Публичный бот: служебные уведомления hermes (фоновые задачи, статусы,
+# [IMPORTANT:]-вставки) не должны попадать в эфир — фильтруем на входе в send
+_SERVICE_MARKERS = ("Фоновая задача",)
+_SERVICE_PREFIXES = ("[IMPORTANT:", "✅ Фоновая", "❌ Фоновая", "🔄 Фоновая")
+
+
+def _is_service_message(text: str) -> bool:
+    stripped = text.lstrip()
+    return any(stripped.startswith(p) for p in _SERVICE_PREFIXES) or any(
+        m in text for m in _SERVICE_MARKERS)
 RECONNECT_BACKOFF = [1, 2, 5, 15, 30]
 KEEPALIVE_CHECK_SECONDS = 15.0  # период проверки dropped-события
 RECONNECT_WAIT_SECONDS = 15.0  # сколько send() ждёт реконнекта при обрыве
@@ -336,6 +346,9 @@ class MeshcoreAdapter(BasePlatformAdapter):
         text = (content or "").strip()
         if not text:
             return SendResult(success=False, error="meshcore: empty message")
+        if _is_service_message(text):
+            logger.info("[%s] Dropping service notification (%d chars)", self.name, len(text))
+            return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
         if len(text) > self._reply_limit:
             logger.warning(
                 "[%s] Reply truncated from %d to %d chars (LoRa limit)",
