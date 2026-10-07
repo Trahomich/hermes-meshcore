@@ -50,8 +50,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "192.168.99.23"
 DEFAULT_PORT = 5000
 DEFAULT_REPLY_LIMIT = 130  # жесткий лимит ответов бота (символы)
-RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
+RECONNECT_BACKOFF = [1, 2, 5, 15, 30]
 KEEPALIVE_CHECK_SECONDS = 15.0  # период проверки mc.is_connected
+RECONNECT_WAIT_SECONDS = 15.0  # сколько send() ждёт реконнекта при обрыве
 SEND_TIMEOUT_SECONDS = 60.0  # LoRa медленный: MSG_SENT может идти десятки секунд
 CONTACT_CONNECT_ATTEMPTS = 3  # companion TCP отдаёт контакты через раз — ретраим соединением
 
@@ -119,6 +120,8 @@ class MeshcoreAdapter(BasePlatformAdapter):
             self._reply_limit = DEFAULT_REPLY_LIMIT
         self._mc: Optional["MeshCore"] = None
         self._run_task: Optional[asyncio.Task] = None
+        # будильник: send() при обрыве будит петлю реконнекта немедленно
+        self._wake = asyncio.Event()
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -130,6 +133,7 @@ class MeshcoreAdapter(BasePlatformAdapter):
         if not self._host:
             logger.warning("[%s] MESHCORE_HOST not configured", self.name)
             return False
+        self._wake.clear()
         self._run_task = asyncio.create_task(self._run_loop())
         self._mark_connected()
         self._wire_plugin_handlers(None)
@@ -151,12 +155,18 @@ class MeshcoreAdapter(BasePlatformAdapter):
                 logger.warning("[%s] Session error: %s", self.name, e)
             if not self._running:
                 return
-            # сессия жила больше минуты — сбрасываем backoff
-            if time.monotonic() - session_start >= 60.0:
+            # сессия жила стабильно — сбрасываем backoff
+            if time.monotonic() - session_start >= 30.0:
                 backoff_idx = 0
-            delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
-            logger.info("[%s] Reconnecting to %s:%s in %ds...", self.name, self._host, self._port, delay)
-            await asyncio.sleep(delay)
+            if self._wake.is_set():
+                # ждёт ответ доставки — реконнектим немедленно
+                self._wake.clear()
+                logger.info("[%s] Immediate reconnect (reply pending)", self.name)
+            else:
+                delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
+                logger.info("[%s] Reconnecting to %s:%s in %ds...", self.name, self._host, self._port, delay)
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._wake.wait(), timeout=delay)
             backoff_idx += 1
 
     async def _session(self) -> None:
@@ -166,16 +176,26 @@ class MeshcoreAdapter(BasePlatformAdapter):
         try:
             mc.auto_update_contacts = True
             mc.subscribe(EventType.CONTACT_MSG_RECV, self._on_message)
+            dropped = asyncio.Event()
+            mc.subscribe(EventType.DISCONNECTED, lambda _ev: dropped.set())
             await mc.start_auto_message_fetching()
             node_name = (mc.self_info or {}).get("name") or "?"
             n_contacts = len(getattr(mc, "contacts", {}) or {})
             logger.info(
                 "[%s] Connected to companion '%s' at %s:%s (%d contacts)",
                 self.name, node_name, self._host, self._port, n_contacts)
-            while self._running and mc.is_connected:
-                await asyncio.sleep(KEEPALIVE_CHECK_SECONDS)
-            if not mc.is_connected:
-                raise ConnectionError("companion TCP connection lost")
+            # Проверяем связь ПОСЛЕ интервала: is_connected на старте сессии
+            # гоняется с инициализацией транспортиров и может быть False на
+            # живом соединении.
+            while self._running:
+                done, _ = await asyncio.wait(
+                    [asyncio.create_task(asyncio.sleep(KEEPALIVE_CHECK_SECONDS)),
+                     asyncio.create_task(dropped.wait())],
+                    return_when=asyncio.FIRST_COMPLETED)
+                if not self._running:
+                    return
+                if dropped.is_set() or not mc.is_connected:
+                    raise ConnectionError("companion TCP connection lost")
         finally:
             self._mc = None
             with suppress(Exception):
@@ -266,6 +286,18 @@ class MeshcoreAdapter(BasePlatformAdapter):
         """Отправка личного сообщения контакту, лимит ``reply_limit`` символов."""
         mc = self._mc
         if mc is None or not mc.is_connected:
+            # разбудить петлю реконнекта и дождаться восстановления
+            self._wake.set()
+            logger.info("[%s] Not connected — waiting for reconnect to deliver reply", self.name)
+            deadline = time.monotonic() + RECONNECT_WAIT_SECONDS
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.5)
+                mc = self._mc
+                if mc is not None and mc.is_connected:
+                    break
+            else:
+                return SendResult(success=False, error="meshcore: companion node unreachable")
+        if mc is None or not mc.is_connected:
             return SendResult(success=False, error="meshcore: not connected to companion node")
         text = (content or "").strip()
         if not text:
@@ -286,7 +318,7 @@ class MeshcoreAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"meshcore node error: {getattr(result, 'payload', None)}")
         return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
 
-    async def send_typing(self, chat_id: str) -> None:
+    async def send_typing(self, chat_id: str, **_kwargs) -> None:
         """LoRa не имеет индикатора набора — no-op."""
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
