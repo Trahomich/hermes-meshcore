@@ -51,9 +51,10 @@ DEFAULT_HOST = "192.168.99.23"
 DEFAULT_PORT = 5000
 DEFAULT_REPLY_LIMIT = 130  # жесткий лимит ответов бота (символы)
 # Публичный бот: служебные уведомления hermes (фоновые задачи, статусы,
-# [IMPORTANT:]-вставки) не должны попадать в эфир — фильтруем на входе в send
-_SERVICE_MARKERS = ("Фоновая задача",)
-_SERVICE_PREFIXES = ("[IMPORTANT:", "✅ Фоновая", "❌ Фоновая", "🔄 Фоновая")
+# [IMPORTANT:]-вставки, ♻️ Recovered reply от delivery ledger) не должны
+# попадать в эфир — фильтруем на входе в send
+_SERVICE_MARKERS = ("Фоновая задача", "Recovered reply")
+_SERVICE_PREFIXES = ("[IMPORTANT:", "✅ Фоновая", "❌ Фоновая", "🔄 Фоновая", "♻️")
 
 
 def _is_service_message(text: str) -> bool:
