@@ -40,3 +40,11 @@ optional_env:
     description: "Human label for the home channel"
     prompt: "Home channel display name (or empty)"
     password: false
+  - name: MESHCORE_LISTEN_CHANNELS
+    description: "Comma-separated channel names/indices the bot listens to (e.g. #test,public). Empty = off"
+    prompt: "Channels to listen (comma-separated, or empty)"
+    password: false
+  - name: MESHCORE_CHANNEL_TRIGGERS
+    description: "Comma-separated trigger words: bot answers in channel only when mentioned (default: бот,bot,aibot)"
+    prompt: "Channel trigger words (comma-separated)"
+    password: false

@@ -40,6 +40,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms._shared import (
     get_scoped_secret as _get_scoped_secret, send_error,
     extra_or_secret as _extra_or_secret, seed_extra_from_env as _seed_extra_from_env,
@@ -71,6 +72,15 @@ CONTACT_CONNECT_ATTEMPTS = 3  # companion TCP отдаёт контакты че
 # send) перехватывает слот. Плановая ротация соединения возвращает слот адаптеру.
 RESLOT_INTERVAL_SECONDS = 60.0
 DRAIN_MAX_MESSAGES = 50  # лимит принудительной выгрузки при подключении
+CHANNEL_SLOTS = 8  # слоты каналов ноды, опрашиваем get_channel
+DEFAULT_CHANNEL_TRIGGERS = "бот,bot,aibot"
+CHAN_DEDUP_WINDOW_SECONDS = 300
+CHAN_DEDUP_MAX_SIZE = 500
+
+
+def _norm_chan(name: str) -> str:
+    """Нормализованное имя канала: без '#', нижний регистр."""
+    return (name or "").strip().lower().lstrip("#")
 
 
 async def _connect_with_contacts(host: str, port: int) -> "MeshCore":
@@ -138,6 +148,16 @@ class MeshcoreAdapter(BasePlatformAdapter):
         self._run_task: Optional[asyncio.Task] = None
         # будильник: send() при обрыве будит петлю реконнекта немедленно
         self._wake = asyncio.Event()
+        # каналы: слушаем только настроенные, отвечаем в тот же канал
+        raw_channels = str(_extra_or_secret(
+            extra, "listen_channels", "MESHCORE_LISTEN_CHANNELS", "") or "")
+        self._listen_channels = {_norm_chan(c) for c in raw_channels.split(",") if _norm_chan(c)}
+        raw_triggers = str(_extra_or_secret(
+            extra, "channel_triggers", "MESHCORE_CHANNEL_TRIGGERS", DEFAULT_CHANNEL_TRIGGERS) or "")
+        self._channel_triggers = [t.strip().lower() for t in raw_triggers.split(",") if t.strip()]
+        self._chan_names: Dict[int, str] = {}
+        self._chan_dedup = MessageDeduplicator(
+            max_size=CHAN_DEDUP_MAX_SIZE, ttl_seconds=CHAN_DEDUP_WINDOW_SECONDS)
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -198,6 +218,9 @@ class MeshcoreAdapter(BasePlatformAdapter):
         try:
             mc.auto_update_contacts = True
             mc.subscribe(EventType.CONTACT_MSG_RECV, self._on_message)
+            if self._listen_channels:
+                await self._discover_channels(mc)
+                mc.subscribe(EventType.CHANNEL_MSG_RECV, self._on_channel_message)
             dropped = asyncio.Event()
             mc.subscribe(EventType.DISCONNECTED, lambda _ev: dropped.set())
             await mc.start_auto_message_fetching()
@@ -301,6 +324,61 @@ class MeshcoreAdapter(BasePlatformAdapter):
         logger.debug("[%s] Message from %s: %s", self.name, name, text[:60])
         await self.handle_message(message_event)
 
+    async def _discover_channels(self, mc) -> None:
+        """Опрашиваем слоты каналов ноды: idx → нормализованное имя."""
+        names: Dict[int, str] = {}
+        for idx in range(CHANNEL_SLOTS):
+            with suppress(Exception):
+                ev = await mc.commands.get_channel(idx)
+                payload = getattr(ev, "payload", None) or {}
+                name = payload.get("channel_name")
+                if name:
+                    names[idx] = _norm_chan(name)
+        self._chan_names = names
+        listening = sorted(c for c in self._listen_channels if c in names.values())
+        logger.info("[%s] Channels discovered: %s; listening: %s",
+                    self.name,
+                    {i: n for i, n in names.items()},
+                    listening or "none matched")
+
+    async def _on_channel_message(self, event) -> None:
+        """Сообщение в канале: отвечаем в тот же канал, только если позвали."""
+        if not self._listen_channels:
+            return
+        payload = getattr(event, "payload", None) or {}
+        if payload.get("type") != "CHAN":
+            return
+        idx = payload.get("channel_idx")
+        name = self._chan_names.get(idx, "")
+        # канал должен быть в списке (по имени или индексу)
+        if name not in self._listen_channels and str(idx) not in self._listen_channels:
+            return
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            return
+        low = text.lower()
+        if not any(t in low for t in self._channel_triggers):
+            return  # бота не звали — молчим
+        msg_id = hashlib.sha256(
+            f"chan|{idx}|{text}|{payload.get('sender_timestamp', '')}".encode()
+        ).hexdigest()[:16]
+        if self._chan_dedup.is_duplicate(msg_id):
+            return
+        chan_chat = f"chan:{idx}"
+        chan_label = f"#{name}" if name else f"#chan{idx}"
+        source = self.build_source(
+            chat_id=chan_chat, chat_name=chan_label, chat_type="group",
+            user_id=chan_chat, user_name=chan_label, message_id=msg_id)
+        ts = payload.get("sender_timestamp")
+        timestamp = datetime.now(tz=timezone.utc)
+        with suppress((ValueError, OSError, TypeError, OverflowError)):
+            if isinstance(ts, (int, float)) and ts > 0:
+                timestamp = datetime.fromtimestamp(ts, tz=timezone.utc)
+        logger.debug("[%s] Channel %s trigger: %s", self.name, chan_label, text[:60])
+        await self.handle_message(MessageEvent(
+            text=text, message_type=MessageType.TEXT, source=source,
+            message_id=msg_id, raw_message=payload, timestamp=timestamp))
+
     # -- Outbound messaging -------------------------------------------------
 
     def _resolve_destination(self, chat_id: str) -> Optional[Any]:
@@ -355,13 +433,24 @@ class MeshcoreAdapter(BasePlatformAdapter):
                 "[%s] Reply truncated from %d to %d chars (LoRa limit)",
                 self.name, len(text), self._reply_limit)
             text = text[:self._reply_limit].rstrip()
-        destination = self._resolve_destination(chat_id)
-        if destination is None:
-            return SendResult(success=False, error=f"meshcore: contact '{chat_id}' not found")
+        # канальный адрес "chan:<idx>" — отправка в канал, контакт не нужен
+        chan_idx: Optional[int] = None
+        if chat_id.startswith("chan:"):
+            try:
+                chan_idx = int(chat_id.split(":", 1)[1])
+            except ValueError:
+                return SendResult(success=False, error=f"meshcore: bad channel id '{chat_id}'")
+        else:
+            destination = self._resolve_destination(chat_id)
+            if destination is None:
+                return SendResult(success=False, error=f"meshcore: contact '{chat_id}' not found")
         result = None
         for attempt in (1, 2):
             try:
-                result = await mc.commands.send_msg(destination, text)
+                if chan_idx is not None:
+                    result = await mc.commands.send_chan_msg(chan_idx, text)
+                else:
+                    result = await mc.commands.send_msg(destination, text)
                 break
             except Exception as e:
                 if attempt == 2 or not self._running:
@@ -382,6 +471,10 @@ class MeshcoreAdapter(BasePlatformAdapter):
         """LoRa не имеет индикатора набора — no-op."""
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        if chat_id.startswith("chan:"):
+            with suppress(ValueError):
+                name = self._chan_names.get(int(chat_id.split(":", 1)[1]), "")
+                return {"name": f"#{name}" if name else chat_id, "type": "group"}
         return {"name": chat_id, "type": "dm"}
 
 
@@ -396,6 +489,8 @@ def _env_enablement() -> dict | None:
     seed = _seed_extra_from_env((
         ("MESHCORE_PORT", "port", None),
         ("MESHCORE_REPLY_LIMIT", "reply_limit", None),
+        ("MESHCORE_LISTEN_CHANNELS", "listen_channels", None),
+        ("MESHCORE_CHANNEL_TRIGGERS", "channel_triggers", None),
     ), home_env="MESHCORE_HOME_CHANNEL", home_default=None)
     extra: Dict[str, Any] = {"host": host}
     with suppress((TypeError, ValueError)):
