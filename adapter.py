@@ -255,6 +255,12 @@ class MeshcoreAdapter(BasePlatformAdapter):
         # Только личные текстовые сообщения; CHAN/DATA игнорируем
         if payload.get("type") not in (None, "PRIV"):
             return
+        # txt_type: 0 = текст, 1 = бинарные/application-данные (передача
+        # файлов, чанки, ACK) — публичному боту вложения запрещены, мимо
+        if payload.get("txt_type") not in (None, 0, 2):
+            logger.debug("[%s] Skipping binary/application message (txt_type=%s)",
+                         self.name, payload.get("txt_type"))
+            return
         text = str(payload.get("text") or "").strip()
         if not text:
             return
