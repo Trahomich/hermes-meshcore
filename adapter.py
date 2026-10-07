@@ -184,17 +184,21 @@ class MeshcoreAdapter(BasePlatformAdapter):
             logger.info(
                 "[%s] Connected to companion '%s' at %s:%s (%d contacts)",
                 self.name, node_name, self._host, self._port, n_contacts)
-            # Проверяем связь ПОСЛЕ интервала: is_connected на старте сессии
-            # гоняется с инициализацией транспортиров и может быть False на
-            # живом соединении.
+            # ВАЖНО: mc.is_connected у meshcore 2.3.15 на TCP-транспорте всегда
+            # False даже на живом соединении — не использовать как признак жизни.
+            # Живём до события DISCONNECTED от библиотеки.
             while self._running:
-                done, _ = await asyncio.wait(
-                    [asyncio.create_task(asyncio.sleep(KEEPALIVE_CHECK_SECONDS)),
-                     asyncio.create_task(dropped.wait())],
-                    return_when=asyncio.FIRST_COMPLETED)
+                sleep_task = asyncio.create_task(asyncio.sleep(KEEPALIVE_CHECK_SECONDS))
+                drop_task = asyncio.create_task(dropped.wait())
+                try:
+                    _done, pending = await asyncio.wait(
+                        {sleep_task, drop_task}, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    for task in (sleep_task, drop_task):
+                        task.cancel()
                 if not self._running:
                     return
-                if dropped.is_set() or not mc.is_connected:
+                if drop_task in _done and dropped.is_set():
                     raise ConnectionError("companion TCP connection lost")
         finally:
             self._mc = None
@@ -283,22 +287,23 @@ class MeshcoreAdapter(BasePlatformAdapter):
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Отправка личного сообщения контакту, лимит ``reply_limit`` символов."""
+        """Отправка личного сообщения контакту, лимит ``reply_limit`` символов.
+
+        is_connected ненадёжен (см. _session) — шлём и решаем по факту:
+        при ошибке будим петлю реконнекта и повторяем один раз.
+        """
         mc = self._mc
-        if mc is None or not mc.is_connected:
-            # разбудить петлю реконнекта и дождаться восстановления
+        if mc is None:
             self._wake.set()
-            logger.info("[%s] Not connected — waiting for reconnect to deliver reply", self.name)
+            logger.info("[%s] No session — waiting for connect to deliver reply", self.name)
             deadline = time.monotonic() + RECONNECT_WAIT_SECONDS
             while time.monotonic() < deadline:
                 await asyncio.sleep(0.5)
                 mc = self._mc
-                if mc is not None and mc.is_connected:
+                if mc is not None:
                     break
-            else:
-                return SendResult(success=False, error="meshcore: companion node unreachable")
-        if mc is None or not mc.is_connected:
-            return SendResult(success=False, error="meshcore: not connected to companion node")
+            if mc is None:
+                return SendResult(success=False, error="meshcore: no companion session")
         text = (content or "").strip()
         if not text:
             return SendResult(success=False, error="meshcore: empty message")
@@ -310,10 +315,22 @@ class MeshcoreAdapter(BasePlatformAdapter):
         destination = self._resolve_destination(chat_id)
         if destination is None:
             return SendResult(success=False, error=f"meshcore: contact '{chat_id}' not found")
-        try:
-            result = await mc.commands.send_msg(destination, text)
-        except Exception as e:
-            return SendResult(success=False, error=f"meshcore send failed: {e}")
+        result = None
+        for attempt in (1, 2):
+            try:
+                result = await mc.commands.send_msg(destination, text)
+                break
+            except Exception as e:
+                if attempt == 2 or not self._running:
+                    return SendResult(success=False, error=f"meshcore send failed: {e}")
+                logger.warning("[%s] Send attempt 1 failed (%s) — waking reconnect", self.name, e)
+                self._wake.set()
+                deadline = time.monotonic() + RECONNECT_WAIT_SECONDS
+                while time.monotonic() < deadline and (self._mc is None or self._mc is mc):
+                    await asyncio.sleep(0.5)
+                mc = self._mc
+                if mc is None:
+                    return SendResult(success=False, error="meshcore: companion node unreachable")
         if result is not None and getattr(result, "type", None) == EventType.ERROR:
             return SendResult(success=False, error=f"meshcore node error: {getattr(result, 'payload', None)}")
         return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
