@@ -468,7 +468,9 @@ class MeshcoreAdapter(BasePlatformAdapter):
                             and payload.get("reason") == "no_event_received"):
                         stale_session = True
                 else:
-                    result = await mc.commands.send_msg(destination, text)
+                    # send_msg_with_retry: при неудаче по сохранённому пути
+                    # (протухшие пути при миграции репитеров) уходит во flood
+                    result = await mc.commands.send_msg_with_retry(destination, text)
                 if not stale_session:
                     break
                 if attempt == 1 and self._running:
