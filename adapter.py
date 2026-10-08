@@ -66,6 +66,7 @@ RECONNECT_BACKOFF = [1, 2, 5, 15, 30]
 KEEPALIVE_CHECK_SECONDS = 15.0  # период проверки dropped-события
 RECONNECT_WAIT_SECONDS = 15.0  # сколько send() ждёт реконнекта при обрыве
 SEND_TIMEOUT_SECONDS = 60.0  # LoRa медленный: MSG_SENT может идти десятки секунд
+CHANNEL_SEND_TIMEOUT_SECONDS = 10.0  # нода ACK-ает канал мгновенно (OK); дольше = протухшая сессия
 CONTACT_CONNECT_ATTEMPTS = 3  # companion TCP отдаёт контакты через раз — ретраим соединением
 # Нода (fw v1.17.1) шлёт уведомление MESSAGES_WAITING только самому свежему
 # подключившемуся TCP-клиенту. Любой посторонний клиент (CLI-запрос, standalone
@@ -180,6 +181,7 @@ class MeshcoreAdapter(BasePlatformAdapter):
         backoff_idx = 0
         session_start = 0.0
         while self._running:
+            self._wake.clear()  # форс-ротация отработана, новая сессия сейчас будет
             planned_rotation = False
             try:
                 session_start = time.monotonic()
@@ -244,16 +246,20 @@ class MeshcoreAdapter(BasePlatformAdapter):
             while self._running:
                 sleep_task = asyncio.create_task(asyncio.sleep(KEEPALIVE_CHECK_SECONDS))
                 drop_task = asyncio.create_task(dropped.wait())
+                wake_task = asyncio.create_task(self._wake.wait())
                 try:
                     _done, _pending = await asyncio.wait(
-                        {sleep_task, drop_task}, return_when=asyncio.FIRST_COMPLETED)
+                        {sleep_task, drop_task, wake_task}, return_when=asyncio.FIRST_COMPLETED)
                 finally:
-                    for task in (sleep_task, drop_task):
+                    for task in (sleep_task, drop_task, wake_task):
                         task.cancel()
                 if not self._running:
                     return
                 if drop_task in _done and dropped.is_set():
                     raise ConnectionError("companion TCP connection lost")
+                if wake_task in _done and self._wake.is_set():
+                    logger.debug("[%s] Forced reslot (wake)", self.name)
+                    return  # send() требует свежую сессию — ротируем сейчас
                 if time.monotonic() >= session_deadline:
                     logger.debug("[%s] Planned reslot reconnect", self.name)
                     return  # плановая ротация: _run_loop переподключится сразу
@@ -445,13 +451,38 @@ class MeshcoreAdapter(BasePlatformAdapter):
             if destination is None:
                 return SendResult(success=False, error=f"meshcore: contact '{chat_id}' not found")
         result = None
+        stale_session = False
         for attempt in (1, 2):
             try:
                 if chan_idx is not None:
-                    result = await mc.commands.send_chan_msg(chan_idx, text)
+                    # здоровая нода отвечает на канал OK мгновенно; долгое
+                    # молчание = сессия потеряла слот — быстрее в реконнект
+                    saved_timeout = mc.default_timeout
+                    mc.default_timeout = CHANNEL_SEND_TIMEOUT_SECONDS
+                    try:
+                        result = await mc.commands.send_chan_msg(chan_idx, text)
+                    finally:
+                        mc.default_timeout = saved_timeout
+                    payload = getattr(result, "payload", None) or {}
+                    if (getattr(result, "type", None) == EventType.ERROR
+                            and payload.get("reason") == "no_event_received"):
+                        stale_session = True
                 else:
                     result = await mc.commands.send_msg(destination, text)
-                break
+                if not stale_session:
+                    break
+                if attempt == 1 and self._running:
+                    # сессия потеряла слот у ноды — форсируем реконнект и
+                    # повторяем уже на свежем соединении
+                    logger.info("[%s] Channel send not ACKed — forcing reslot", self.name)
+                    self._wake.set()
+                    deadline = time.monotonic() + RECONNECT_WAIT_SECONDS
+                    while time.monotonic() < deadline and (self._mc is None or self._mc is mc):
+                        await asyncio.sleep(0.5)
+                    mc = self._mc
+                    if mc is None:
+                        return SendResult(success=False, error="meshcore: companion node unreachable")
+                    stale_session = False
             except Exception as e:
                 if attempt == 2 or not self._running:
                     return SendResult(success=False, error=f"meshcore send failed: {e}")
