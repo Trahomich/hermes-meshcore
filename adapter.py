@@ -67,6 +67,7 @@ KEEPALIVE_CHECK_SECONDS = 15.0  # период проверки dropped-собы
 RECONNECT_WAIT_SECONDS = 15.0  # сколько send() ждёт реконнекта при обрыве
 SEND_TIMEOUT_SECONDS = 60.0  # LoRa медленный: MSG_SENT может идти десятки секунд
 CHANNEL_SEND_TIMEOUT_SECONDS = 10.0  # нода ACK-ает канал мгновенно (OK); дольше = протухшая сессия
+DM_SEND_TOTAL_SECONDS = 25.0  # общий лимит send_msg_with_retry: airtime ~5с, дольше = узел не отвечает
 CONTACT_CONNECT_ATTEMPTS = 3  # companion TCP отдаёт контакты через раз — ретраим соединением
 # Нода (fw v1.17.1) шлёт уведомление MESSAGES_WAITING только самому свежему
 # подключившемуся TCP-клиенту. Любой посторонний клиент (CLI-запрос, standalone
@@ -468,9 +469,22 @@ class MeshcoreAdapter(BasePlatformAdapter):
                             and payload.get("reason") == "no_event_received"):
                         stale_session = True
                 else:
-                    # send_msg_with_retry: при неудаче по сохранённому пути
-                    # (протухшие пути при миграции репитеров) уходит во flood
-                    result = await mc.commands.send_msg_with_retry(destination, text)
+                    # send_msg_with_retry: flood-fallback при протухшем пути,
+                    # но с жёстким общим лимитом — иначе либа крутит 60с-таймауты
+                    saved_timeout = mc.default_timeout
+                    mc.default_timeout = 20.0
+                    try:
+                        result = await asyncio.wait_for(
+                            mc.commands.send_msg_with_retry(destination, text),
+                            timeout=DM_SEND_TOTAL_SECONDS)
+                    except asyncio.TimeoutError:
+                        stale_session = True
+                    finally:
+                        mc.default_timeout = saved_timeout
+                    payload = getattr(result, "payload", None) or {}
+                    if (getattr(result, "type", None) == EventType.ERROR
+                            and payload.get("reason") == "no_event_received"):
+                        stale_session = True
                 if not stale_session:
                     break
                 if attempt == 1 and self._running:
