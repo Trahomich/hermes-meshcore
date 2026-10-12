@@ -325,11 +325,18 @@ class MeshcoreAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=chat_id, chat_name=name, chat_type="dm",
             user_id=chat_id, user_name=name, message_id=msg_id)
-        message_event = MessageEvent(
-            text=text, message_type=MessageType.TEXT, source=source,
-            message_id=msg_id, raw_message=payload, timestamp=timestamp)
+        ts = payload.get("sender_timestamp")
+        timestamp = datetime.now(tz=timezone.utc)
+        with suppress((ValueError, OSError, TypeError, OverflowError)):
+            if isinstance(ts, (int, float)) and ts > 0:
+                timestamp = datetime.fromtimestamp(ts, tz=timezone.utc)
         logger.debug("[%s] Message from %s: %s", self.name, name, text[:60])
-        await self.handle_message(message_event)
+        # Идентификатор отправителя в каждом сообщении: шлюз внедряет origin-JSON
+        # не на каждом ходу, а права (например, админ) определяются по pubkey
+        tagged_text = f"[id:{chat_id}] {text}"
+        await self.handle_message(MessageEvent(
+            text=tagged_text, message_type=MessageType.TEXT, source=source,
+            message_id=msg_id, raw_message=payload, timestamp=timestamp))
 
     async def _discover_channels(self, mc) -> None:
         """Опрашиваем слоты каналов ноды: idx → нормализованное имя."""
@@ -374,19 +381,16 @@ class MeshcoreAdapter(BasePlatformAdapter):
         chan_chat = f"chan:{idx}"
         chan_label = f"#{name}" if name else f"#chan{idx}"
         source = self.build_source(
-            chat_id=chat_id, chat_name=name, chat_type="dm",
-            user_id=chat_id, user_name=name, message_id=msg_id)
+            chat_id=chan_chat, chat_name=chan_label, chat_type="group",
+            user_id=chan_chat, user_name=chan_label, message_id=msg_id)
         ts = payload.get("sender_timestamp")
         timestamp = datetime.now(tz=timezone.utc)
         with suppress((ValueError, OSError, TypeError, OverflowError)):
             if isinstance(ts, (int, float)) and ts > 0:
                 timestamp = datetime.fromtimestamp(ts, tz=timezone.utc)
-        logger.debug("[%s] Message from %s: %s", self.name, name, text[:60])
-        # Идентификатор отправителя в каждом сообщении: шлюз внедряет origin-JSON
-        # не на каждом ходу, а права (например, админ) определяются по pubkey
-        tagged_text = f"[id:{chat_id}] {text}"
+        logger.debug("[%s] Channel %s trigger: %s", self.name, chan_label, text[:60])
         await self.handle_message(MessageEvent(
-            text=tagged_text, message_type=MessageType.TEXT, source=source,
+            text=text, message_type=MessageType.TEXT, source=source,
             message_id=msg_id, raw_message=payload, timestamp=timestamp))
 
     # -- Outbound messaging -------------------------------------------------
