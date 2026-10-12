@@ -67,7 +67,7 @@ KEEPALIVE_CHECK_SECONDS = 15.0  # период проверки dropped-собы
 RECONNECT_WAIT_SECONDS = 15.0  # сколько send() ждёт реконнекта при обрыве
 SEND_TIMEOUT_SECONDS = 60.0  # LoRa медленный: MSG_SENT может идти десятки секунд
 CHANNEL_SEND_TIMEOUT_SECONDS = 10.0  # нода ACK-ает канал мгновенно (OK); дольше = протухшая сессия
-DM_SEND_TOTAL_SECONDS = 25.0  # общий лимит send_msg_with_retry: airtime ~5с, дольше = узел не отвечает
+DM_SEND_TOTAL_SECONDS = 40.0  # общий лимит send_msg_with_retry: airtime + очередь ноды
 CONTACT_CONNECT_ATTEMPTS = 3  # companion TCP отдаёт контакты через раз — ретраим соединением
 # Нода (fw v1.17.1) шлёт уведомление MESSAGES_WAITING только самому свежему
 # подключившемуся TCP-клиенту. Любой посторонний клиент (CLI-запрос, standalone
@@ -517,7 +517,10 @@ class MeshcoreAdapter(BasePlatformAdapter):
                 mc = self._mc
                 if mc is None:
                     return SendResult(success=False, error="meshcore: companion node unreachable")
-        if result is not None and getattr(result, "type", None) == EventType.ERROR:
+        if result is None:
+            # обе попытки истекли по таймауту — ничего не отправлено
+            return SendResult(success=False, error="meshcore: send timed out (node not ACKing)")
+        if getattr(result, "type", None) == EventType.ERROR:
             return SendResult(success=False, error=f"meshcore node error: {getattr(result, 'payload', None)}")
         return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
 
