@@ -419,23 +419,15 @@ class MeshcoreAdapter(BasePlatformAdapter):
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Отправка личного сообщения контакту, лимит ``reply_limit`` символов.
+        """Отправка по одноразовому соединению, лимит ``reply_limit`` символов.
 
-        is_connected ненадёжен (см. _session) — шлём и решаем по факту:
-        при ошибке будим петлю реконнекта и повторяем один раз.
+        Companion-канал ноды фактически полудуплексный: на приёмной сессии
+        адаптера параллельно работают подписки/drain/auto-fetch, и send-команды
+        на ней стабильно голодают (no_event_received). Короткое выделенное
+        соединение для каждой отправки работает мгновенно (проверено) и не
+        зависит от состояния приёмной сессии. Слот уведомлений RX-сессия
+        возвращает себе плановой ротацией; накопленное добирается drain'ом.
         """
-        mc = self._mc
-        if mc is None:
-            self._wake.set()
-            logger.info("[%s] No session — waiting for connect to deliver reply", self.name)
-            deadline = time.monotonic() + RECONNECT_WAIT_SECONDS
-            while time.monotonic() < deadline:
-                await asyncio.sleep(0.5)
-                mc = self._mc
-                if mc is not None:
-                    break
-            if mc is None:
-                return SendResult(success=False, error="meshcore: no companion session")
         text = (content or "").strip()
         if not text:
             return SendResult(success=False, error="meshcore: empty message")
@@ -454,72 +446,45 @@ class MeshcoreAdapter(BasePlatformAdapter):
                 chan_idx = int(chat_id.split(":", 1)[1])
             except ValueError:
                 return SendResult(success=False, error=f"meshcore: bad channel id '{chat_id}'")
-        else:
-            destination = self._resolve_destination(chat_id)
-            if destination is None:
-                return SendResult(success=False, error=f"meshcore: contact '{chat_id}' not found")
+
         result = None
-        stale_session = False
-        for attempt in (1, 2):
-            try:
-                if chan_idx is not None:
-                    # здоровая нода отвечает на канал OK мгновенно; долгое
-                    # молчание = сессия потеряла слот — быстрее в реконнект
-                    saved_timeout = mc.default_timeout
-                    mc.default_timeout = CHANNEL_SEND_TIMEOUT_SECONDS
-                    try:
-                        result = await mc.commands.send_chan_msg(chan_idx, text)
-                    finally:
-                        mc.default_timeout = saved_timeout
-                    payload = getattr(result, "payload", None) or {}
-                    if (getattr(result, "type", None) == EventType.ERROR
-                            and payload.get("reason") == "no_event_received"):
-                        stale_session = True
-                else:
-                    # send_msg_with_retry: flood-fallback при протухшем пути,
-                    # но с жёстким общим лимитом — иначе либа крутит 60с-таймауты
-                    saved_timeout = mc.default_timeout
-                    mc.default_timeout = 20.0
-                    try:
-                        result = await asyncio.wait_for(
-                            mc.commands.send_msg_with_retry(destination, text),
-                            timeout=DM_SEND_TOTAL_SECONDS)
-                    except asyncio.TimeoutError:
-                        stale_session = True
-                    finally:
-                        mc.default_timeout = saved_timeout
-                    payload = getattr(result, "payload", None) or {}
-                    if (getattr(result, "type", None) == EventType.ERROR
-                            and payload.get("reason") == "no_event_received"):
-                        stale_session = True
-                if not stale_session:
-                    break
-                if attempt == 1 and self._running:
-                    # сессия потеряла слот у ноды — форсируем реконнект и
-                    # повторяем уже на свежем соединении
-                    logger.info("[%s] Channel send not ACKed — forcing reslot", self.name)
-                    self._wake.set()
-                    deadline = time.monotonic() + RECONNECT_WAIT_SECONDS
-                    while time.monotonic() < deadline and (self._mc is None or self._mc is mc):
-                        await asyncio.sleep(0.5)
-                    mc = self._mc
-                    if mc is None:
-                        return SendResult(success=False, error="meshcore: companion node unreachable")
-                    stale_session = False
-            except Exception as e:
-                if attempt == 2 or not self._running:
-                    return SendResult(success=False, error=f"meshcore send failed: {e}")
-                logger.warning("[%s] Send attempt 1 failed (%s) — waking reconnect", self.name, e)
-                self._wake.set()
-                deadline = time.monotonic() + RECONNECT_WAIT_SECONDS
-                while time.monotonic() < deadline and (self._mc is None or self._mc is mc):
-                    await asyncio.sleep(0.5)
-                mc = self._mc
-                if mc is None:
-                    return SendResult(success=False, error="meshcore: companion node unreachable")
-        if result is None:
-            # обе попытки истекли по таймауту — ничего не отправлено
+        mc = None
+        try:
+            mc = await MeshCore.create_tcp(self._host, self._port)
+            mc.default_timeout = 20.0
+            await mc.connect()
+            with suppress(Exception):
+                await mc.ensure_contacts()
+            if chan_idx is not None:
+                result = await asyncio.wait_for(
+                    mc.commands.send_chan_msg(chan_idx, text),
+                    timeout=CHANNEL_SEND_TIMEOUT_SECONDS + 5)
+            else:
+                destination = None
+                with suppress(Exception):
+                    destination = mc.get_contact_by_key_prefix(chat_id)
+                if destination is None:
+                    with suppress(Exception):
+                        destination = mc.get_contact_by_name(chat_id)
+                if destination is None:
+                    with suppress(ValueError):
+                        bytes.fromhex(chat_id)
+                        destination = chat_id
+                if destination is None:
+                    return SendResult(success=False, error=f"meshcore: contact '{chat_id}' not found")
+                result = await asyncio.wait_for(
+                    mc.commands.send_msg_with_retry(destination, text),
+                    timeout=DM_SEND_TOTAL_SECONDS)
+        except asyncio.TimeoutError:
             return SendResult(success=False, error="meshcore: send timed out (node not ACKing)")
+        except Exception as e:
+            return SendResult(success=False, error=f"meshcore send failed: {e}")
+        finally:
+            if mc is not None:
+                with suppress(Exception):
+                    await mc.disconnect()
+        if result is None:
+            return SendResult(success=False, error="meshcore: send produced no result")
         if getattr(result, "type", None) == EventType.ERROR:
             return SendResult(success=False, error=f"meshcore node error: {getattr(result, 'payload', None)}")
         return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
