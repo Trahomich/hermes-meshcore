@@ -73,6 +73,9 @@ CONTACT_CONNECT_ATTEMPTS = 3  # companion TCP отдаёт контакты че
 # подключившемуся TCP-клиенту. Любой посторонний клиент (CLI-запрос, standalone
 # send) перехватывает слот. Плановая ротация соединения возвращает слот адаптеру.
 RESLOT_INTERVAL_SECONDS = 60.0
+# Страж сессии: если _session() зависла (create_tcp/connect либы висят
+# без таймаута при недоступной ноде) — убить и переподключиться
+SESSION_WATCHDOG_SECONDS = RESLOT_INTERVAL_SECONDS + 120.0
 DRAIN_MAX_MESSAGES = 50  # лимит принудительной выгрузки при подключении
 CHANNEL_SLOTS = 8  # слоты каналов ноды, опрашиваем get_channel
 DEFAULT_CHANNEL_TRIGGERS = "бот,bot,aibot"
@@ -178,7 +181,12 @@ class MeshcoreAdapter(BasePlatformAdapter):
         return True
 
     async def _run_loop(self) -> None:
-        """Надзор над сессиями: реконнект с нарастающим backoff."""
+        """Надзор над сессиями: реконнект с нарастающим backoff.
+
+        Страж SESSION_WATCHDOG_SECONDS: create_tcp/connect либы висят без
+        таймаута при недоступной ноде — без стража петля умирает навсегда
+        (наблюдалось 20.10: сессий нет, шлюз жив).
+        """
         backoff_idx = 0
         session_start = 0.0
         while self._running:
@@ -186,10 +194,19 @@ class MeshcoreAdapter(BasePlatformAdapter):
             planned_rotation = False
             try:
                 session_start = time.monotonic()
-                await self._session()
+                await asyncio.wait_for(
+                    self._session(), timeout=SESSION_WATCHDOG_SECONDS)
                 planned_rotation = True  # нормальный выход из _session = плановая ротация
             except asyncio.CancelledError:
                 return
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[%s] Session watchdog tripped after %.0fs — killing and reconnecting",
+                    self.name, SESSION_WATCHDOG_SECONDS)
+                stuck, self._mc = self._mc, None
+                if stuck is not None:
+                    with suppress(Exception):
+                        await asyncio.wait_for(stuck.disconnect(), timeout=5.0)
             except Exception as e:
                 if not self._running:
                     return
