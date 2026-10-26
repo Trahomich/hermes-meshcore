@@ -205,57 +205,56 @@ class MeshcoreAdapter(BasePlatformAdapter):
     async def _run_loop(self) -> None:
         """Надзор над сессиями: реконнект с нарастающим backoff.
 
-        Страж SESSION_WATCHDOG_SECONDS: create_tcp/connect либы висят без
-        таймаута при недоступной ноде — без стража петля умирает навсегда
-        (наблюдалось 20.10: сессий нет, шлюз жив).
+        Таймаут ONLY на подключение (create_tcp/connect либы висят вечно):
+        после него сессия живёт бесконечно — её завершают dropped-событие,
+        серия провалов опроса или остановка. Обёртывать wait_for вокруг
+        всей сессии НЕЛЬЗЯ: она бесконечна по дизайну, и стореж превращался
+        в ротацию каждые 180с, душившую ноду полными рукопожатиями.
         """
         backoff_idx = 0
         session_start = 0.0
         while self._running:
-            self._wake.clear()  # форс-ротация отработана, новая сессия сейчас будет
-            planned_rotation = False
+            session_start = time.monotonic()
             try:
-                session_start = time.monotonic()
-                await asyncio.wait_for(
-                    self._session(), timeout=SESSION_WATCHDOG_SECONDS)
-                planned_rotation = True  # нормальный выход из _session = плановая ротация
+                # фаза 1 (ограничена): подключение и рукопожатие
+                mc = await asyncio.wait_for(
+                    _connect_with_contacts(self._host, self._port),
+                    timeout=SESSION_WATCHDOG_SECONDS)
             except asyncio.CancelledError:
                 return
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "[%s] Session watchdog tripped after %.0fs — killing and reconnecting",
-                    self.name, SESSION_WATCHDOG_SECONDS)
-                stuck, self._mc = self._mc, None
-                if stuck is not None:
-                    with suppress(Exception):
-                        await asyncio.wait_for(stuck.disconnect(), timeout=5.0)
+            except Exception as e:
+                if not self._running:
+                    return
+                logger.warning("[%s] Connect failed: %s", self.name, e)
+                delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
+                logger.info("[%s] Reconnecting to %s:%s in %ds...", self.name, self._host, self._port, delay)
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._wake.wait(), timeout=delay)
+                backoff_idx += 1
+                continue
+            backoff_idx = 0
+            # фаза 2 (бесконечна): живая сессия
+            try:
+                await self._session_with(mc)
+            except asyncio.CancelledError:
+                return
             except Exception as e:
                 if not self._running:
                     return
                 logger.warning("[%s] Session error: %s", self.name, e)
             if not self._running:
                 return
-            if planned_rotation:
-                # ротация слота уведомлений — переподключаемся без задержки
-                backoff_idx = 0
-                continue
-            # сессия жила стабильно — сбрасываем backoff
+            # сессия жила стабильно — подключаемся снова без задержки
             if time.monotonic() - session_start >= 30.0:
                 backoff_idx = 0
-            if self._wake.is_set():
-                # ждёт ответ доставки — реконнектим немедленно
-                self._wake.clear()
-                logger.info("[%s] Immediate reconnect (reply pending)", self.name)
-            else:
-                delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
-                logger.info("[%s] Reconnecting to %s:%s in %ds...", self.name, self._host, self._port, delay)
-                with suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(self._wake.wait(), timeout=delay)
-            backoff_idx += 1
 
     async def _session(self) -> None:
         """Одна TCP-сессия с нодой: подписки + контроль связи."""
         mc = await _connect_with_contacts(self._host, self._port)
+        await self._session_with(mc)
+
+    async def _session_with(self, mc) -> None:
+        """Живая фаза уже подключённой сессии (бесконечна до обрыва)."""
         self._mc = mc
         try:
             mc.auto_update_contacts = True
