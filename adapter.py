@@ -547,8 +547,11 @@ class MeshcoreAdapter(BasePlatformAdapter):
                         destination = chat_id
                 if destination is None:
                     return SendResult(success=False, error=f"meshcore: contact '{chat_id}' not found")
+                # РОВНО как проверенный рабочий путь (hermes send / standalone):
+                # один send_msg по свежему соединению. Никаких with_retry,
+                # flood-манипуляций и ожиданий ACK — они и теряли ответы.
                 result = await asyncio.wait_for(
-                    mc.commands.send_msg_with_retry(destination, text),
+                    mc.commands.send_msg(destination, text),
                     timeout=DM_SEND_TOTAL_SECONDS)
         except asyncio.TimeoutError:
             return SendResult(success=False, error="meshcore: send timed out (node not ACKing)")
@@ -563,30 +566,8 @@ class MeshcoreAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="meshcore: send produced no result")
         if getattr(result, "type", None) == EventType.ERROR:
             return SendResult(success=False, error=f"meshcore node error: {getattr(result, 'payload', None)}")
-        # DM: ждём подтверждение доставки (ACK); нет ACK — один дубль.
-        # Отсутствие ACK НЕ ошибка: не все клиенты шлют подтверждения,
-        # а дубль повышает шанс доставки. Итог всегда пишем в лог.
-        if chan_idx is None:
-            payload = getattr(result, "payload", None) or {}
-            expected = payload.get("expected_ack")
-            exp_hex = expected.hex() if isinstance(expected, (bytes, bytearray)) else None
-            if exp_hex:
-                if await self._wait_ack(mc, exp_hex, ACK_WAIT_SECONDS):
-                    logger.info("[%s] Delivery ACK received", self.name)
-                    return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
-                logger.warning("[%s] No delivery ACK in %.0fs — resending duplicate",
-                               self.name, ACK_WAIT_SECONDS)
-                with suppress(Exception):
-                    result2 = await asyncio.wait_for(
-                        mc.commands.send_msg_with_retry(destination, text),
-                        timeout=DM_SEND_TOTAL_SECONDS)
-                    payload2 = getattr(result2, "payload", None) or {}
-                    expected2 = payload2.get("expected_ack")
-                    if (isinstance(expected2, (bytes, bytearray))
-                            and await self._wait_ack(mc, expected2.hex(), ACK_WAIT_SECONDS)):
-                        logger.info("[%s] Delivery ACK received after duplicate", self.name)
-                        return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
-                logger.info("[%s] Delivery unconfirmed (no ACK) — duplicate sent", self.name)
+        logger.info("[%s] Reply sent (%d chars, single plain send)",
+                    self.name, len(text), )
         return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
 
     async def send_typing(self, chat_id: str, **_kwargs) -> None:
