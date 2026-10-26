@@ -84,6 +84,7 @@ SEND_TIMEOUT_SECONDS = 60.0  # LoRa медленный: MSG_SENT может ид
 CHANNEL_SEND_TIMEOUT_SECONDS = 10.0  # нода ACK-ает канал мгновенно (OK); дольше = протухшая сессия
 DM_SEND_TOTAL_SECONDS = 40.0  # общий лимит send_msg_with_retry: airtime + очередь ноды
 ACK_WAIT_SECONDS = 20.0  # ожидание подтверждения доставки (ACK; не все клиенты их шлют)
+SEND_TOTAL_BUDGET_SECONDS = 150.0  # жёсткий потолок на всю отправку (connect либы висит без таймаута)
 CONTACT_CONNECT_ATTEMPTS = 3  # companion TCP отдаёт контакты через раз — ретраим соединением
 # Нода (fw v1.17.1) шлёт уведомление MESSAGES_WAITING только самому свежему
 # подключившемуся TCP-клиенту. Любой посторонний клиент (CLI-запрос, standalone
@@ -472,6 +473,21 @@ class MeshcoreAdapter(BasePlatformAdapter):
         return False
 
     async def send(
+        self, chat_id: str, content: str, reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Обёртка с жёстким потолком времени: create_tcp/connect либы висят
+        без таймаута — без потолка отправка умирает навсегда (как 26.10)."""
+        try:
+            return await asyncio.wait_for(
+                self._send_flow(chat_id, content, reply_to, metadata),
+                timeout=SEND_TOTAL_BUDGET_SECONDS)
+        except asyncio.TimeoutError:
+            logger.error("[%s] Send budget %.0fs exceeded — aborting",
+                         self.name, SEND_TOTAL_BUDGET_SECONDS)
+            return SendResult(success=False, error="meshcore: send budget exceeded")
+
+    async def _send_flow(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
