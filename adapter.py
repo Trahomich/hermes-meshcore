@@ -89,7 +89,8 @@ CONTACT_CONNECT_ATTEMPTS = 3  # companion TCP отдаёт контакты че
 # Нода (fw v1.17.1) шлёт уведомление MESSAGES_WAITING только самому свежему
 # подключившемуся TCP-клиенту. Любой посторонний клиент (CLI-запрос, standalone
 # send) перехватывает слот. Плановая ротация соединения возвращает слот адаптеру.
-RESLOT_INTERVAL_SECONDS = 60.0
+RESLOT_INTERVAL_SECONDS = 60.0  # (историческое: ротация отключена — перегружала ноду)
+POLL_INTERVAL_SECONDS = 20.0  # лёгкий опрос очереди вместо ротации
 # Страж сессии: если _session() зависла (create_tcp/connect либы висят
 # без таймаута при недоступной ноде) — убить и переподключиться
 SESSION_WATCHDOG_SECONDS = RESLOT_INTERVAL_SECONDS + 120.0
@@ -279,31 +280,32 @@ class MeshcoreAdapter(BasePlatformAdapter):
                 self.name, node_name, self._host, self._port, n_contacts)
             # ВАЖНО: mc.is_connected у meshcore 2.3.15 на TCP-транспорте всегда
             # False даже на живом соединении — не использовать как признак жизни.
-            # Живём до события DISCONNECTED; плановая ротация — по таймеру RESLOT.
-            session_deadline = time.monotonic() + RESLOT_INTERVAL_SECONDS
+            # Живём ДО события DISCONNECTED. Ротаций НЕТ: полное рукопожатие
+            # (350 контактов + каналы) каждую минуту перегружало ESP32-ноду и
+            # она замолкала. Вместо ротации — лёгкий опрос очереди (get_msg):
+            # тянет накопленное, даже если уведомление ушло другому клиенту.
             while self._running:
-                if self._send_in_flight:
-                    # идёт отправка с ожиданием ACK — не крадём слот, откладываем ротацию
-                    session_deadline = time.monotonic() + 15.0
-                sleep_task = asyncio.create_task(asyncio.sleep(KEEPALIVE_CHECK_SECONDS))
+                sleep_task = asyncio.create_task(asyncio.sleep(POLL_INTERVAL_SECONDS))
                 drop_task = asyncio.create_task(dropped.wait())
-                wake_task = asyncio.create_task(self._wake.wait())
                 try:
                     _done, _pending = await asyncio.wait(
-                        {sleep_task, drop_task, wake_task}, return_when=asyncio.FIRST_COMPLETED)
+                        {sleep_task, drop_task}, return_when=asyncio.FIRST_COMPLETED)
                 finally:
-                    for task in (sleep_task, drop_task, wake_task):
+                    for task in (sleep_task, drop_task):
                         task.cancel()
                 if not self._running:
                     return
                 if drop_task in _done and dropped.is_set():
                     raise ConnectionError("companion TCP connection lost")
-                if wake_task in _done and self._wake.is_set():
-                    logger.debug("[%s] Forced reslot (wake)", self.name)
-                    return  # send() требует свежую сессию — ротируем сейчас
-                if time.monotonic() >= session_deadline:
-                    logger.debug("[%s] Planned reslot reconnect", self.name)
-                    return  # плановая ротация: _run_loop переподключится сразу
+                # лёгкий опрос: одна команда, тянет ожидающие сообщения
+                # и заодно служит проверкой живости сессии
+                with suppress(Exception):
+                    ev = await asyncio.wait_for(
+                        mc.commands.get_msg(timeout=8.0), timeout=10.0)
+                    if ev is not None and ev.type == EventType.ERROR:
+                        logger.warning("[%s] Poll error: %s — reconnecting",
+                                       self.name, getattr(ev, "payload", None))
+                        raise ConnectionError("poll failed")
         finally:
             self._mc = None
             with suppress(Exception):
