@@ -390,15 +390,25 @@ class MeshcoreAdapter(BasePlatformAdapter):
             message_id=msg_id, raw_message=payload, timestamp=timestamp))
 
     async def _discover_channels(self, mc) -> None:
-        """Опрашиваем слоты каналов ноды: idx → нормализованное имя."""
+        """Опрашиваем слоты каналов ноды: idx → нормализованное имя.
+
+        Каждый запрос ограничен 5с: здоровая нода отвечает мгновенно,
+        а на больной запросы висят по 60с и растягивают рукопожатие
+        на многие минуты.
+        """
         names: Dict[int, str] = {}
-        for idx in range(CHANNEL_SLOTS):
-            with suppress(Exception):
-                ev = await mc.commands.get_channel(idx)
-                payload = getattr(ev, "payload", None) or {}
-                name = payload.get("channel_name")
-                if name:
-                    names[idx] = _norm_chan(name)
+        saved_timeout = mc.default_timeout
+        mc.default_timeout = 5.0
+        try:
+            for idx in range(CHANNEL_SLOTS):
+                with suppress(Exception):
+                    ev = await mc.commands.get_channel(idx)
+                    payload = getattr(ev, "payload", None) or {}
+                    name = payload.get("channel_name")
+                    if name:
+                        names[idx] = _norm_chan(name)
+        finally:
+            mc.default_timeout = saved_timeout
         self._chan_names = names
         listening = sorted(c for c in self._listen_channels if c in names.values())
         logger.info("[%s] Channels discovered: %s; listening: %s",
