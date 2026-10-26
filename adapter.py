@@ -91,6 +91,7 @@ CONTACT_CONNECT_ATTEMPTS = 3  # companion TCP отдаёт контакты че
 # send) перехватывает слот. Плановая ротация соединения возвращает слот адаптеру.
 RESLOT_INTERVAL_SECONDS = 60.0  # (историческое: ротация отключена — перегружала ноду)
 POLL_INTERVAL_SECONDS = 20.0  # лёгкий опрос очереди вместо ротации
+POLL_FAIL_RECONNECT = 10  # реконнект только после N подряд провалов опроса
 # Страж сессии: если _session() зависла (create_tcp/connect либы висят
 # без таймаута при недоступной ноде) — убить и переподключиться
 SESSION_WATCHDOG_SECONDS = RESLOT_INTERVAL_SECONDS + 120.0
@@ -284,6 +285,7 @@ class MeshcoreAdapter(BasePlatformAdapter):
             # (350 контактов + каналы) каждую минуту перегружало ESP32-ноду и
             # она замолкала. Вместо ротации — лёгкий опрос очереди (get_msg):
             # тянет накопленное, даже если уведомление ушло другому клиенту.
+            poll_failures = 0
             while self._running:
                 sleep_task = asyncio.create_task(asyncio.sleep(POLL_INTERVAL_SECONDS))
                 drop_task = asyncio.create_task(dropped.wait())
@@ -297,15 +299,23 @@ class MeshcoreAdapter(BasePlatformAdapter):
                     return
                 if drop_task in _done and dropped.is_set():
                     raise ConnectionError("companion TCP connection lost")
-                # лёгкий опрос: одна команда, тянет ожидающие сообщения
-                # и заодно служит проверкой живости сессии
-                with suppress(Exception):
+                # лёгкий опрос: одна команда; неудача ≠ мёртвая сессия
+                # (сообщения идут по подписке). Рвём сессию только после
+                # POLL_FAIL_RECONNECT подряд провалов — частые реконнекты
+                # с полным рукопожатием сами душат ноду.
+                try:
                     ev = await asyncio.wait_for(
                         mc.commands.get_msg(timeout=8.0), timeout=10.0)
-                    if ev is not None and ev.type == EventType.ERROR:
-                        logger.warning("[%s] Poll error: %s — reconnecting",
-                                       self.name, getattr(ev, "payload", None))
-                        raise ConnectionError("poll failed")
+                    poll_failures = 0
+                except Exception:
+                    poll_failures += 1
+                    if poll_failures >= POLL_FAIL_RECONNECT:
+                        logger.warning(
+                            "[%s] %d consecutive poll failures — reconnecting",
+                            self.name, poll_failures)
+                        raise ConnectionError("poll failing repeatedly")
+                    logger.debug("[%s] Poll failed (%d/%d)", self.name,
+                                 poll_failures, POLL_FAIL_RECONNECT)
         finally:
             self._mc = None
             with suppress(Exception):
