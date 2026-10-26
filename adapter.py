@@ -68,6 +68,7 @@ RECONNECT_WAIT_SECONDS = 15.0  # сколько send() ждёт реконнек
 SEND_TIMEOUT_SECONDS = 60.0  # LoRa медленный: MSG_SENT может идти десятки секунд
 CHANNEL_SEND_TIMEOUT_SECONDS = 10.0  # нода ACK-ает канал мгновенно (OK); дольше = протухшая сессия
 DM_SEND_TOTAL_SECONDS = 40.0  # общий лимит send_msg_with_retry: airtime + очередь ноды
+ACK_WAIT_SECONDS = 45.0  # ожидание подтверждения доставки (ACK от аппарата получателя)
 CONTACT_CONNECT_ATTEMPTS = 3  # companion TCP отдаёт контакты через раз — ретраим соединением
 # Нода (fw v1.17.1) шлёт уведомление MESSAGES_WAITING только самому свежему
 # подключившемуся TCP-клиенту. Любой посторонний клиент (CLI-запрос, standalone
@@ -432,6 +433,23 @@ class MeshcoreAdapter(BasePlatformAdapter):
         except ValueError:
             return None
 
+    async def _wait_ack(self, mc, expected_hex: str, timeout: float) -> bool:
+        """Ждём ACK с кодом expected_hex — подтверждение доставки от получателя."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and self._running:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            with suppress(Exception):
+                ev = await mc.wait_for_event(
+                    EventType.ACK, timeout=min(5.0, remaining))
+                if ev is not None:
+                    code = ((getattr(ev, "payload", None) or {}).get("code") or "")
+                    if code == expected_hex:
+                        return True
+                    # чужой ACK — ждём дальше
+        return False
+
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
@@ -504,6 +522,32 @@ class MeshcoreAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="meshcore: send produced no result")
         if getattr(result, "type", None) == EventType.ERROR:
             return SendResult(success=False, error=f"meshcore node error: {getattr(result, 'payload', None)}")
+        # DM: ждём подтверждение доставки (ACK от аппарата получателя);
+        # нет ACK — один повтор; нет снова — честная ошибка
+        if chan_idx is None:
+            payload = getattr(result, "payload", None) or {}
+            expected = payload.get("expected_ack")
+            exp_hex = expected.hex() if isinstance(expected, (bytes, bytearray)) else None
+            if exp_hex:
+                if await self._wait_ack(mc, exp_hex, ACK_WAIT_SECONDS):
+                    logger.info("[%s] Delivery ACK received", self.name)
+                    return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+                logger.warning("[%s] No delivery ACK in %.0fs — resending once",
+                               self.name, ACK_WAIT_SECONDS)
+                result = await asyncio.wait_for(
+                    mc.commands.send_msg_with_retry(destination, text),
+                    timeout=DM_SEND_TOTAL_SECONDS)
+                if getattr(result, "type", None) == EventType.ERROR:
+                    return SendResult(success=False, error=f"meshcore resend error: {getattr(result, 'payload', None)}")
+                payload = getattr(result, "payload", None) or {}
+                expected = payload.get("expected_ack")
+                exp_hex = expected.hex() if isinstance(expected, (bytes, bytearray)) else None
+                if exp_hex and await self._wait_ack(mc, exp_hex, ACK_WAIT_SECONDS):
+                    logger.info("[%s] Delivery ACK received after resend", self.name)
+                    return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+                return SendResult(
+                    success=False,
+                    error="meshcore: подтверждение доставки не получено — вероятно, не доставлено")
         return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
 
     async def send_typing(self, chat_id: str, **_kwargs) -> None:
