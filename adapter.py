@@ -62,6 +62,21 @@ def _is_service_message(text: str) -> bool:
     stripped = text.lstrip()
     return any(stripped.startswith(p) for p in _SERVICE_PREFIXES) or any(
         m in text for m in _SERVICE_MARKERS)
+
+
+def _strip_recovery_marker(text: str) -> str:
+    """Снять обёртку delivery-ledger («♻️ Recovered reply — …:\\n\\nТЕКСТ»).
+
+    Это ПОВТОРНАЯ доставка реального ответа, а не служебный шум: доставляем
+    тело без маркера. Маркер без тела — мусор, вернём пустую строку.
+    """
+    if not text.startswith("♻️"):
+        return text
+    for sep in (":\n\n", ":\n"):
+        idx = text.find(sep)
+        if idx != -1:
+            return text[idx + len(sep):].strip()
+    return ""
 RECONNECT_BACKOFF = [1, 2, 5, 15, 30]
 KEEPALIVE_CHECK_SECONDS = 15.0  # период проверки dropped-события
 RECONNECT_WAIT_SECONDS = 15.0  # сколько send() ждёт реконнекта при обрыве
@@ -470,6 +485,8 @@ class MeshcoreAdapter(BasePlatformAdapter):
         возвращает себе плановой ротацией; накопленное добирается drain'ом.
         """
         text = (content or "").strip()
+        # повторная доставка реального ответа: снять ♻️-обёртку, доставить тело
+        text = _strip_recovery_marker(text)
         if not text:
             return SendResult(success=False, error="meshcore: empty message")
         if _is_service_message(text):
