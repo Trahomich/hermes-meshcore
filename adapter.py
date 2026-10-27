@@ -298,12 +298,20 @@ class MeshcoreAdapter(BasePlatformAdapter):
                     return
                 if drop_task in _done and dropped.is_set():
                     raise ConnectionError("companion TCP connection lost")
-                # лёгкий опрос: одна команда; неудача ≠ мёртвая сессия
-                # (сообщения идут по подписке). Рвём сессию только после
-                # POLL_FAIL_RECONNECT подряд провалов — частые реконнекты
-                # с полным рукопожатием сами душат ноду.
+                # Выгребаем очередь ДО ПУСТОТЫ каждый цикл: нода держит
+                # в очереди весь канальный шум (public/test/ping), и личные
+                # сообщения тонут за ним. Один get_msg за цикл не успевал —
+                # сообщения неделями стояли в очереди.
+                with suppress(Exception):
+                    for _ in range(DRAIN_MAX_MESSAGES):
+                        ev = await asyncio.wait_for(
+                            mc.commands.get_msg(timeout=8.0), timeout=10.0)
+                        if ev is None or ev.type in (EventType.NO_MORE_MSGS, EventType.ERROR):
+                            break
+                        await asyncio.sleep(0.05)
+                # проверка живости: команда выше не ответила подряд — рвём
                 try:
-                    ev = await asyncio.wait_for(
+                    await asyncio.wait_for(
                         mc.commands.get_msg(timeout=8.0), timeout=10.0)
                     poll_failures = 0
                 except Exception:
@@ -313,8 +321,6 @@ class MeshcoreAdapter(BasePlatformAdapter):
                             "[%s] %d consecutive poll failures — reconnecting",
                             self.name, poll_failures)
                         raise ConnectionError("poll failing repeatedly")
-                    logger.debug("[%s] Poll failed (%d/%d)", self.name,
-                                 poll_failures, POLL_FAIL_RECONNECT)
         finally:
             self._mc = None
             with suppress(Exception):
