@@ -1,22 +1,24 @@
 """meshcore platform adapter: MeshCore (LoRa mesh) companion node over TCP.
 
-Connects to one MeshCore companion radio node via the ``meshcore`` Python
-library (TCP transport), answers private messages (``CONTACT_MSG_RECV``) from
-mesh contacts, and sends replies back over the air. Outgoing replies are
-hard-truncated to ``MESHCORE_REPLY_LIMIT`` characters (default 130) — LoRa
-airtime is precious and the bot's persona mandates short answers.
+Архитектура (v3, рефакторинг после двух недель боевых находок):
 
-config.yaml ``platforms.meshcore.extra``: ``host`` (required), ``port``
-(default 5000), ``reply_limit`` (default 130). Env (read at construct time;
-``extra`` wins over env): MESHCORE_HOST, MESHCORE_PORT, MESHCORE_REPLY_LIMIT,
-MESHCORE_ALLOWED_USERS (contact names), MESHCORE_ALLOW_ALL_USERS,
-MESHCORE_HOME_CHANNEL (contact name for cron delivery),
-MESHCORE_HOME_CHANNEL_NAME.
+- ПРИЁМ: постоянных сессий НЕТ. Каждые CYCLE_SECONDS — лёгкий цикл:
+  connect (appstart+self_info, ~2 команды) → выгрузка очереди get_msg до
+  NO_MORE_MSGS → disconnect. Нода отдаёт очередь только самому свежему
+  клиенту и «зомбит» долгоживущие сессии — короткие циклы гарантируют
+  наши сообщения. Отправки (свои короткие соединения) ничего не крадут:
+  следующий цикл вернёт очередь нам. Латентность приёма ≤ CYCLE_SECONDS.
+- ОТПРАВКА: одноразовое соединение, один plain send_msg (проверенный
+  путь), жёсткий бюджет на всё.
+- Никаких: ротаций с полным рукопожатием (душили ноду), send_msg_with_retry
+  (терял ответы), ожиданий ACK (клиент их не шлёт), is_connected (врёт),
+  бесконечных ожиданий (всё ограничено таймаутами).
 
-Identity: MeshCore contacts are identified by their public-key prefix (hex).
-``chat_id`` == pubkey prefix; cron/home delivery targets a contact by name.
-Unknown senders with no stored contact are answered via the raw key prefix
-(MeshCore encrypts to the pubkey, a contact-list entry is not required).
+config.yaml platforms.meshcore.extra: host (required), port (5000),
+reply_limit (130), listen_channels ("" = выкл), channel_triggers
+(бот,bot,aibot). Env: MESHCORE_HOST, MESHCORE_PORT, MESHCORE_REPLY_LIMIT,
+MESHCORE_LISTEN_CHANNELS, MESHCORE_CHANNEL_TRIGGERS, MESHCORE_ALLOWED_USERS,
+MESHCORE_ALLOW_ALL_USERS, MESHCORE_HOME_CHANNEL(_NAME).
 """
 
 import asyncio
@@ -26,7 +28,7 @@ import time
 import uuid
 from contextlib import suppress
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 try:
     from meshcore import MeshCore
@@ -50,12 +52,26 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_HOST = "192.168.99.23"
 DEFAULT_PORT = 5000
-DEFAULT_REPLY_LIMIT = 130  # жесткий лимит ответов бота (символы)
-# Публичный бот: служебные уведомления hermes (фоновые задачи, статусы,
-# [IMPORTANT:]-вставки, ♻️ Recovered reply от delivery ledger) не должны
-# попадать в эфир — фильтруем на входе в send
+DEFAULT_REPLY_LIMIT = 130
+DEFAULT_CHANNEL_TRIGGERS = "бот,bot,aibot"
+
+CYCLE_SECONDS = 30.0        # период приёмного цикла (латентность приёма)
+CYCLE_BUDGET_SECONDS = 25.0 # жёсткий потолок одного цикла (либа висит без таймаутов)
+DRAIN_MAX_MESSAGES = 80     # сообщений за цикл максимум
+COMMAND_TIMEOUT = 8.0       # таймаут одной команды ноде
+SEND_BUDGET_SECONDS = 90.0  # жёсткий потолок всей отправки
+CHANNEL_SLOTS = 8           # слоты каналов (обнаружение разовое)
+CHANNEL_QUERY_TIMEOUT = 5.0
+DEDUP_WINDOW = 300
+DEDUP_SIZE = 500
+
+# Служебные уведомления hermes не уходят в эфир
 _SERVICE_MARKERS = ("Фоновая задача", "Recovered reply", "Прерываю текущую задачу")
-_SERVICE_PREFIXES = ("[IMPORTANT:", "✅ Фоновая", "❌ Фоновая", "🔄 Фоновая", "♻️", "⚡", "⚡️")
+_SERVICE_PREFIXES = ("[IMPORTANT:", "✅ Фоновая", "❌ Фоновая", "🔄 Фоновая", "♻️")
+
+
+def _norm_chan(name: str) -> str:
+    return (name or "").strip().lower().lstrip("#")
 
 
 def _is_service_message(text: str) -> bool:
@@ -65,11 +81,7 @@ def _is_service_message(text: str) -> bool:
 
 
 def _strip_recovery_marker(text: str) -> str:
-    """Снять обёртку delivery-ledger («♻️ Recovered reply — …:\\n\\nТЕКСТ»).
-
-    Это ПОВТОРНАЯ доставка реального ответа, а не служебный шум: доставляем
-    тело без маркера. Маркер без тела — мусор, вернём пустую строку.
-    """
+    """Повторная доставка реального ответа: снять ♻️-обёртку, доставить тело."""
     if not text.startswith("♻️"):
         return text
     for sep in (":\n\n", ":\n"):
@@ -77,57 +89,6 @@ def _strip_recovery_marker(text: str) -> str:
         if idx != -1:
             return text[idx + len(sep):].strip()
     return ""
-RECONNECT_BACKOFF = [1, 2, 5, 15, 30]
-KEEPALIVE_CHECK_SECONDS = 15.0  # период проверки dropped-события
-RECONNECT_WAIT_SECONDS = 15.0  # сколько send() ждёт реконнекта при обрыве
-SEND_TIMEOUT_SECONDS = 60.0  # LoRa медленный: MSG_SENT может идти десятки секунд
-CHANNEL_SEND_TIMEOUT_SECONDS = 10.0  # нода ACK-ает канал мгновенно (OK); дольше = протухшая сессия
-DM_SEND_TOTAL_SECONDS = 40.0  # общий лимит send_msg_with_retry: airtime + очередь ноды
-ACK_WAIT_SECONDS = 20.0  # ожидание подтверждения доставки (ACK; не все клиенты их шлют)
-SEND_TOTAL_BUDGET_SECONDS = 150.0  # жёсткий потолок на всю отправку (connect либы висит без таймаута)
-CONTACT_CONNECT_ATTEMPTS = 3  # companion TCP отдаёт контакты через раз — ретраим соединением
-# Нода (fw v1.17.1) шлёт уведомление MESSAGES_WAITING только самому свежему
-# подключившемуся TCP-клиенту. Любой посторонний клиент (CLI-запрос, standalone
-# send) перехватывает слот. Плановая ротация соединения возвращает слот адаптеру.
-RESLOT_INTERVAL_SECONDS = 60.0  # (историческое: ротация отключена — перегружала ноду)
-POLL_INTERVAL_SECONDS = 20.0  # лёгкий опрос очереди вместо ротации
-POLL_FAIL_RECONNECT = 10  # реконнект только после N подряд провалов опроса
-# Страж сессии: если _session() зависла (create_tcp/connect либы висят
-# без таймаута при недоступной ноде) — убить и переподключиться
-SESSION_WATCHDOG_SECONDS = RESLOT_INTERVAL_SECONDS + 120.0
-DRAIN_MAX_MESSAGES = 50  # лимит принудительной выгрузки при подключении
-CHANNEL_SLOTS = 8  # слоты каналов ноды, опрашиваем get_channel
-DEFAULT_CHANNEL_TRIGGERS = "бот,bot,aibot"
-CHAN_DEDUP_WINDOW_SECONDS = 300
-CHAN_DEDUP_MAX_SIZE = 500
-
-
-def _norm_chan(name: str) -> str:
-    """Нормализованное имя канала: без '#', нижний регистр."""
-    return (name or "").strip().lower().lstrip("#")
-
-
-async def _connect_with_contacts(host: str, port: int) -> "MeshCore":
-    """Соединение с нодой, пока не получим список контактов (или attempts исчерпаны).
-
-    Замеченная особенность companion TCP: первый запрос после переподключения
-    иногда молча теряется (ensure_contacts отрабатывает без ошибки, контактов 0).
-    Переподключение решает; сырые hex-цели работают и без контактов.
-    """
-    mc = None
-    for attempt in range(CONTACT_CONNECT_ATTEMPTS):
-        mc = await MeshCore.create_tcp(host, port)
-        mc.default_timeout = SEND_TIMEOUT_SECONDS
-        await mc.connect()
-        with suppress(Exception):
-            await mc.ensure_contacts()
-        if len(getattr(mc, "contacts", {}) or {}):
-            return mc
-        logger.debug("meshcore: connect attempt %d returned no contacts, retrying", attempt + 1)
-        with suppress(Exception):
-            await mc.disconnect()
-        await asyncio.sleep(1.0)
-    return mc
 
 
 def _host_value(extra: Dict[str, Any]) -> str:
@@ -135,17 +96,14 @@ def _host_value(extra: Dict[str, Any]) -> str:
 
 
 def check_requirements() -> bool:
-    """Библиотека установлена и хост ноды задан (без полной загрузки конфига)."""
     return MESHCORE_AVAILABLE and bool(_get_scoped_secret("MESHCORE_HOST", "").strip())
 
 
 def validate_config(config) -> bool:
-    """Хост задан (config.yaml ``extra`` или env)."""
     return bool(_host_value(getattr(config, "extra", {}) or {}))
 
 
 def is_connected(config) -> bool:
-    """Платформа сконфигурирована (env или config.yaml)."""
     return bool(
         _get_scoped_secret("MESHCORE_HOST", "").strip()
         or _host_value(getattr(config, "extra", {}) or {}) != DEFAULT_HOST
@@ -153,285 +111,134 @@ def is_connected(config) -> bool:
 
 
 class MeshcoreAdapter(BasePlatformAdapter):
-    """MeshCore adapter: TCP → companion node, private messages in/out."""
+    """MeshCore adapter: приём циклами выгрузки, отправка одним send_msg."""
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config=config, platform=Platform("meshcore"))
         extra = config.extra or {}
-        self._host: str = _host_value(extra) or DEFAULT_HOST
-        try:
-            self._port: int = int(_extra_or_secret(extra, "port", "MESHCORE_PORT", DEFAULT_PORT))
-        except (TypeError, ValueError):
-            self._port = DEFAULT_PORT
-        try:
-            self._reply_limit: int = int(
-                _extra_or_secret(extra, "reply_limit", "MESHCORE_REPLY_LIMIT", DEFAULT_REPLY_LIMIT))
-        except (TypeError, ValueError):
-            self._reply_limit = DEFAULT_REPLY_LIMIT
-        self._mc: Optional["MeshCore"] = None
-        self._run_task: Optional[asyncio.Task] = None
-        # будильник: send() при обрыве будит петлю реконнекта немедленно
-        self._wake = asyncio.Event()
-        # каналы: слушаем только настроенные, отвечаем в тот же канал
+        self._host = _host_value(extra) or DEFAULT_HOST
+        self._port = DEFAULT_PORT
+        with suppress((TypeError, ValueError)):
+            self._port = int(_extra_or_secret(extra, "port", "MESHCORE_PORT", DEFAULT_PORT))
+        self._reply_limit = DEFAULT_REPLY_LIMIT
+        with suppress((TypeError, ValueError)):
+            self._reply_limit = int(_extra_or_secret(
+                extra, "reply_limit", "MESHCORE_REPLY_LIMIT", DEFAULT_REPLY_LIMIT))
         raw_channels = str(_extra_or_secret(
             extra, "listen_channels", "MESHCORE_LISTEN_CHANNELS", "") or "")
         self._listen_channels = {_norm_chan(c) for c in raw_channels.split(",") if _norm_chan(c)}
         raw_triggers = str(_extra_or_secret(
-            extra, "channel_triggers", "MESHCORE_CHANNEL_TRIGGERS", DEFAULT_CHANNEL_TRIGGERS) or "")
+            extra, "channel_triggers", "MESHCORE_CHANNEL_TRIGGERS",
+            DEFAULT_CHANNEL_TRIGGERS) or "")
         self._channel_triggers = [t.strip().lower() for t in raw_triggers.split(",") if t.strip()]
         self._chan_names: Dict[int, str] = {}
-        self._chan_dedup = MessageDeduplicator(
-            max_size=CHAN_DEDUP_MAX_SIZE, ttl_seconds=CHAN_DEDUP_WINDOW_SECONDS)
-        # счётчик активных отправок: пока >0 приёмная ротация не крадёт
-        # слот «самого свежего клиента» у отправляющего соединения
-        self._send_in_flight = 0
+        self._dedup = MessageDeduplicator(max_size=DEDUP_SIZE, ttl_seconds=DEDUP_WINDOW)
+        self._rx_task: Optional[asyncio.Task] = None
 
-    # -- Connection lifecycle -----------------------------------------------
+    # -- Lifecycle ----------------------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        """Подключение к ноде: фоновая задача с автоматическим реконнектом."""
         if not MESHCORE_AVAILABLE:
-            logger.warning("[%s] meshcore library not installed. Run: pip install meshcore", self.name)
+            logger.warning("[%s] meshcore library not installed", self.name)
             return False
         if not self._host:
             logger.warning("[%s] MESHCORE_HOST not configured", self.name)
             return False
-        self._wake.clear()
-        self._run_task = asyncio.create_task(self._run_loop())
+        self._rx_task = asyncio.create_task(self._rx_loop())
         self._mark_connected()
         self._wire_plugin_handlers(None)
         return True
 
-    async def _run_loop(self) -> None:
-        """Надзор над сессиями: реконнект с нарастающим backoff.
-
-        Таймаут ONLY на подключение (create_tcp/connect либы висят вечно):
-        после него сессия живёт бесконечно — её завершают dropped-событие,
-        серия провалов опроса или остановка. Обёртывать wait_for вокруг
-        всей сессии НЕЛЬЗЯ: она бесконечна по дизайну, и стореж превращался
-        в ротацию каждые 180с, душившую ноду полными рукопожатиями.
-        """
-        backoff_idx = 0
-        session_start = 0.0
-        while self._running:
-            session_start = time.monotonic()
-            try:
-                # фаза 1 (ограничена): подключение и рукопожатие
-                mc = await asyncio.wait_for(
-                    _connect_with_contacts(self._host, self._port),
-                    timeout=SESSION_WATCHDOG_SECONDS)
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                if not self._running:
-                    return
-                logger.warning("[%s] Connect failed: %s", self.name, e)
-                delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
-                logger.info("[%s] Reconnecting to %s:%s in %ds...", self.name, self._host, self._port, delay)
-                with suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(self._wake.wait(), timeout=delay)
-                backoff_idx += 1
-                continue
-            backoff_idx = 0
-            # фаза 2 (бесконечна): живая сессия
-            try:
-                await self._session_with(mc)
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                if not self._running:
-                    return
-                logger.warning("[%s] Session error: %s", self.name, e)
-            if not self._running:
-                return
-            # сессия жила стабильно — подключаемся снова без задержки
-            if time.monotonic() - session_start >= 30.0:
-                backoff_idx = 0
-
-    async def _session(self) -> None:
-        """Одна TCP-сессия с нодой: подписки + контроль связи."""
-        mc = await _connect_with_contacts(self._host, self._port)
-        await self._session_with(mc)
-
-    async def _session_with(self, mc) -> None:
-        """Живая фаза уже подключённой сессии (бесконечна до обрыва)."""
-        self._mc = mc
-        try:
-            mc.auto_update_contacts = True
-            mc.subscribe(EventType.CONTACT_MSG_RECV, self._on_message)
-            if self._listen_channels:
-                await self._discover_channels(mc)
-                mc.subscribe(EventType.CHANNEL_MSG_RECV, self._on_channel_message)
-            dropped = asyncio.Event()
-            mc.subscribe(EventType.DISCONNECTED, lambda _ev: dropped.set())
-            await mc.start_auto_message_fetching()
-            # Полный дрейн: lib при подписке забирает только одно сообщение,
-            # а уведомление о накопившихся мог уйти другому/ушедшему клиенту
-            with suppress(Exception):
-                for _ in range(DRAIN_MAX_MESSAGES):
-                    ev = await mc.commands.get_msg(timeout=10)
-                    if ev is None or ev.type in (EventType.NO_MORE_MSGS, EventType.ERROR):
-                        break
-                    await asyncio.sleep(0.1)
-            node_name = (mc.self_info or {}).get("name") or "?"
-            n_contacts = len(getattr(mc, "contacts", {}) or {})
-            logger.info(
-                "[%s] Connected to companion '%s' at %s:%s (%d contacts)",
-                self.name, node_name, self._host, self._port, n_contacts)
-            # ВАЖНО: mc.is_connected у meshcore 2.3.15 на TCP-транспорте всегда
-            # False даже на живом соединении — не использовать как признак жизни.
-            # Живём ДО события DISCONNECTED. Ротаций НЕТ: полное рукопожатие
-            # (350 контактов + каналы) каждую минуту перегружало ESP32-ноду и
-            # она замолкала. Вместо ротации — лёгкий опрос очереди (get_msg):
-            # тянет накопленное, даже если уведомление ушло другому клиенту.
-            poll_failures = 0
-            while self._running:
-                sleep_task = asyncio.create_task(asyncio.sleep(POLL_INTERVAL_SECONDS))
-                drop_task = asyncio.create_task(dropped.wait())
-                try:
-                    _done, _pending = await asyncio.wait(
-                        {sleep_task, drop_task}, return_when=asyncio.FIRST_COMPLETED)
-                finally:
-                    for task in (sleep_task, drop_task):
-                        task.cancel()
-                if not self._running:
-                    return
-                if drop_task in _done and dropped.is_set():
-                    raise ConnectionError("companion TCP connection lost")
-                # Выгребаем очередь ДО ПУСТОТЫ каждый цикл: нода держит
-                # в очереди весь канальный шум (public/test/ping), и личные
-                # сообщения тонут за ним. Один get_msg за цикл не успевал —
-                # сообщения неделями стояли в очереди.
-                with suppress(Exception):
-                    for _ in range(DRAIN_MAX_MESSAGES):
-                        ev = await asyncio.wait_for(
-                            mc.commands.get_msg(timeout=8.0), timeout=10.0)
-                        if ev is None or ev.type in (EventType.NO_MORE_MSGS, EventType.ERROR):
-                            break
-                        await asyncio.sleep(0.05)
-                # проверка живости: команда выше не ответила подряд — рвём
-                try:
-                    await asyncio.wait_for(
-                        mc.commands.get_msg(timeout=8.0), timeout=10.0)
-                    poll_failures = 0
-                except Exception:
-                    poll_failures += 1
-                    if poll_failures >= POLL_FAIL_RECONNECT:
-                        logger.warning(
-                            "[%s] %d consecutive poll failures — reconnecting",
-                            self.name, poll_failures)
-                        raise ConnectionError("poll failing repeatedly")
-        finally:
-            self._mc = None
-            with suppress(Exception):
-                await mc.stop_auto_message_fetching()
-            with suppress(Exception):
-                await mc.disconnect()
-
     async def disconnect(self) -> None:
-        """Отключение от ноды."""
         self._running = False
         self._mark_disconnected()
-        if self._run_task:
-            self._run_task.cancel()
+        if self._rx_task:
+            self._rx_task.cancel()
             with suppress(asyncio.CancelledError):
-                await self._run_task
-            self._run_task = None
-        mc, self._mc = self._mc, None
-        if mc is not None:
-            with suppress(Exception):
-                await mc.stop_auto_message_fetching()
-            with suppress(Exception):
-                await mc.disconnect()
+                await self._rx_task
+            self._rx_task = None
         logger.info("[%s] Disconnected", self.name)
 
-    # -- Inbound message processing -----------------------------------------
+    # -- Приём: циклы выгрузки очереди ---------------------------------------
 
-    async def _on_message(self, event) -> None:
-        """Входящее личное сообщение из эфира → агент."""
-        payload = getattr(event, "payload", None) or {}
-        # Только личные текстовые сообщения; CHAN/DATA игнорируем
-        if payload.get("type") not in (None, "PRIV"):
-            return
-        # txt_type: 0 = текст, 1 = бинарные/application-данные (передача
-        # файлов, чанки, ACK) — публичному боту вложения запрещены, мимо
+    async def _rx_loop(self) -> None:
+        """Каждый цикл — свежее лёгкое подключение и выгрузка очереди до пустоты."""
+        backoff = 0
+        while self._running:
+            try:
+                drained = await asyncio.wait_for(
+                    self._drain_cycle(), timeout=CYCLE_BUDGET_SECONDS)
+                backoff = 0
+                if drained:
+                    logger.info("[%s] Cycle drained %d message(s)", self.name, drained)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning("[%s] Cycle error: %s", self.name, e)
+            delay = CYCLE_SECONDS if backoff == 0 else min(CYCLE_SECONDS * backoff, 120.0)
+            with suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.sleep(delay), timeout=delay + 1)
+            backoff = min(backoff + 1, 4)
+
+    async def _drain_cycle(self) -> int:
+        """Лёгкий цикл: connect → get_msg до NO_MORE → disconnect."""
+        mc = await MeshCore.create_tcp(self._host, self._port)
+        mc.default_timeout = COMMAND_TIMEOUT
+        await mc.connect()
+        count = 0
+        try:
+            if self._listen_channels and not self._chan_names:
+                with suppress(Exception):
+                    await self._discover_channels_once(mc)
+            for _ in range(DRAIN_MAX_MESSAGES):
+                ev = await mc.commands.get_msg(timeout=COMMAND_TIMEOUT)
+                if ev is None or ev.type in (EventType.NO_MORE_MSGS, EventType.ERROR):
+                    break
+                count += 1
+                await self._dispatch(getattr(ev, "payload", None) or {})
+                await asyncio.sleep(0.05)
+        finally:
+            with suppress(Exception):
+                await mc.disconnect()
+        return count
+
+    async def _dispatch(self, payload: Dict[str, Any]) -> None:
+        """Разобрать выгруженное сообщение: DM всегда, каналы — по триггеру."""
+        ptype = payload.get("type")
+        if ptype == "PRIV":
+            await self._handle_dm(payload)
+        elif ptype == "CHAN":
+            await self._handle_channel(payload)
+
+    async def _handle_dm(self, payload: Dict[str, Any]) -> None:
         if payload.get("txt_type") not in (None, 0, 2):
-            logger.debug("[%s] Skipping binary/application message (txt_type=%s)",
-                         self.name, payload.get("txt_type"))
-            return
+            return  # бинарные/файлы — мимо
         text = str(payload.get("text") or "").strip()
         if not text:
             return
-        mc = self._mc
-        if mc is None:
-            return
         prefix = str(payload.get("pubkey_prefix") or "").strip()
-        contact = None
-        with suppress(Exception):
-            contact = mc.get_contact_by_key_prefix(prefix)
-        name = (contact or {}).get("adv_name") or prefix[:8] or "unknown"
-        chat_id = prefix or name
+        chat_id = prefix or "unknown"
         msg_id = hashlib.sha256(
             f"{chat_id}|{text}|{payload.get('sender_timestamp', '')}".encode()
         ).hexdigest()[:16]
-        ts = payload.get("sender_timestamp")
-        timestamp = datetime.now(tz=timezone.utc)
-        with suppress((ValueError, OSError, TypeError, OverflowError)):
-            if isinstance(ts, (int, float)) and ts > 0:
-                timestamp = datetime.fromtimestamp(ts, tz=timezone.utc)
+        if self._dedup.is_duplicate(msg_id):
+            return
+        name = chat_id[:8]
         source = self.build_source(
             chat_id=chat_id, chat_name=name, chat_type="dm",
             user_id=chat_id, user_name=name, message_id=msg_id)
-        ts = payload.get("sender_timestamp")
-        timestamp = datetime.now(tz=timezone.utc)
-        with suppress((ValueError, OSError, TypeError, OverflowError)):
-            if isinstance(ts, (int, float)) and ts > 0:
-                timestamp = datetime.fromtimestamp(ts, tz=timezone.utc)
-        logger.debug("[%s] Message from %s: %s", self.name, name, text[:60])
-        # Идентификатор отправителя в каждом сообщении: шлюз внедряет origin-JSON
-        # не на каждом ходу, а права (например, админ) определяются по pubkey
-        tagged_text = f"[id:{chat_id}] {text}"
+        timestamp = self._ts(payload)
+        # [id:pubkey] — криптографическая метка отправителя (права админа)
         await self.handle_message(MessageEvent(
-            text=tagged_text, message_type=MessageType.TEXT, source=source,
-            message_id=msg_id, raw_message=payload, timestamp=timestamp))
+            text=f"[id:{chat_id}] {text}", message_type=MessageType.TEXT,
+            source=source, message_id=msg_id, raw_message=payload, timestamp=timestamp))
+        logger.info("[%s] DM from %s: %s", self.name, name, text[:50])
 
-    async def _discover_channels(self, mc) -> None:
-        """Опрашиваем слоты каналов ноды: idx → нормализованное имя.
-
-        Каждый запрос ограничен 5с: здоровая нода отвечает мгновенно,
-        а на больной запросы висят по 60с и растягивают рукопожатие
-        на многие минуты.
-        """
-        names: Dict[int, str] = {}
-        saved_timeout = mc.default_timeout
-        mc.default_timeout = 5.0
-        try:
-            for idx in range(CHANNEL_SLOTS):
-                with suppress(Exception):
-                    ev = await mc.commands.get_channel(idx)
-                    payload = getattr(ev, "payload", None) or {}
-                    name = payload.get("channel_name")
-                    if name:
-                        names[idx] = _norm_chan(name)
-        finally:
-            mc.default_timeout = saved_timeout
-        self._chan_names = names
-        listening = sorted(c for c in self._listen_channels if c in names.values())
-        logger.info("[%s] Channels discovered: %s; listening: %s",
-                    self.name,
-                    {i: n for i, n in names.items()},
-                    listening or "none matched")
-
-    async def _on_channel_message(self, event) -> None:
-        """Сообщение в канале: отвечаем в тот же канал, только если позвали."""
+    async def _handle_channel(self, payload: Dict[str, Any]) -> None:
         if not self._listen_channels:
-            return
-        payload = getattr(event, "payload", None) or {}
-        if payload.get("type") != "CHAN":
             return
         idx = payload.get("channel_idx")
         name = self._chan_names.get(idx, "")
-        # канал должен быть в списке (по имени или индексу)
         if name not in self._listen_channels and str(idx) not in self._listen_channels:
             return
         text = str(payload.get("text") or "").strip()
@@ -439,129 +246,86 @@ class MeshcoreAdapter(BasePlatformAdapter):
             return
         low = text.lower()
         if not any(t in low for t in self._channel_triggers):
-            return  # бота не звали — молчим
+            return  # бота не звали
         msg_id = hashlib.sha256(
             f"chan|{idx}|{text}|{payload.get('sender_timestamp', '')}".encode()
         ).hexdigest()[:16]
-        if self._chan_dedup.is_duplicate(msg_id):
+        if self._dedup.is_duplicate(msg_id):
             return
-        chan_chat = f"chan:{idx}"
-        chan_label = f"#{name}" if name else f"#chan{idx}"
+        label = f"#{name}" if name else f"#chan{idx}"
         source = self.build_source(
-            chat_id=chan_chat, chat_name=chan_label, chat_type="group",
-            user_id=chan_chat, user_name=chan_label, message_id=msg_id)
-        ts = payload.get("sender_timestamp")
-        timestamp = datetime.now(tz=timezone.utc)
-        with suppress((ValueError, OSError, TypeError, OverflowError)):
-            if isinstance(ts, (int, float)) and ts > 0:
-                timestamp = datetime.fromtimestamp(ts, tz=timezone.utc)
-        logger.debug("[%s] Channel %s trigger: %s", self.name, chan_label, text[:60])
+            chat_id=f"chan:{idx}", chat_name=label, chat_type="group",
+            user_id=f"chan:{idx}", user_name=label, message_id=msg_id)
         await self.handle_message(MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source,
-            message_id=msg_id, raw_message=payload, timestamp=timestamp))
+            message_id=msg_id, raw_message=payload, timestamp=self._ts(payload)))
+        logger.info("[%s] Channel %s trigger: %s", self.name, label, text[:50])
 
-    # -- Outbound messaging -------------------------------------------------
+    @staticmethod
+    def _ts(payload: Dict[str, Any]) -> datetime:
+        ts = payload.get("sender_timestamp")
+        with suppress((ValueError, OSError, TypeError, OverflowError)):
+            if isinstance(ts, (int, float)) and ts > 0:
+                return datetime.fromtimestamp(ts, tz=timezone.utc)
+        return datetime.now(tz=timezone.utc)
 
-    def _resolve_destination(self, chat_id: str) -> Optional[Any]:
-        """Контакт по pubkey-префиксу, затем по имени, затем сырой hex-ключ."""
-        mc = self._mc
-        if mc is None or not chat_id:
-            return None
-        with suppress(Exception):
-            contact = mc.get_contact_by_key_prefix(chat_id)
-            if contact:
-                return contact
-        with suppress(Exception):
-            contact = mc.get_contact_by_name(chat_id)
-            if contact:
-                return contact
-        # неизвестный отправитель: отвечаем прямо на pubkey-префикс
+    async def _discover_channels_once(self, mc) -> None:
+        """Разовое обнаружение имён каналов (5с на запрос)."""
+        saved = mc.default_timeout
+        mc.default_timeout = CHANNEL_QUERY_TIMEOUT
+        names: Dict[int, str] = {}
         try:
-            bytes.fromhex(chat_id)
-            return chat_id
-        except ValueError:
-            return None
+            for idx in range(CHANNEL_SLOTS):
+                with suppress(Exception):
+                    ev = await mc.commands.get_channel(idx)
+                    name = ((getattr(ev, "payload", None) or {}).get("channel_name"))
+                    if name:
+                        names[idx] = _norm_chan(name)
+        finally:
+            mc.default_timeout = saved
+        self._chan_names = names
 
-    async def _wait_ack(self, mc, expected_hex: str, timeout: float) -> bool:
-        """Ждём ACK с кодом expected_hex — подтверждение доставки от получателя."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and self._running:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            with suppress(Exception):
-                ev = await mc.wait_for_event(
-                    EventType.ACK, timeout=min(5.0, remaining))
-                if ev is not None:
-                    code = ((getattr(ev, "payload", None) or {}).get("code") or "")
-                    if code == expected_hex:
-                        return True
-                    # чужой ACK — ждём дальше
-        return False
+    # -- Отправка ------------------------------------------------------------
 
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Обёртка с жёстким потолком времени: create_tcp/connect либы висят
-        без таймаута — без потолка отправка умирает навсегда (как 26.10)."""
+        """Один plain send_msg по свежему соединению; весь процесс ограничен."""
         try:
             return await asyncio.wait_for(
-                self._send_flow(chat_id, content, reply_to, metadata),
-                timeout=SEND_TOTAL_BUDGET_SECONDS)
+                self._send_flow(chat_id, content), timeout=SEND_BUDGET_SECONDS)
         except asyncio.TimeoutError:
-            logger.error("[%s] Send budget %.0fs exceeded — aborting",
-                         self.name, SEND_TOTAL_BUDGET_SECONDS)
+            logger.error("[%s] Send budget exceeded", self.name)
             return SendResult(success=False, error="meshcore: send budget exceeded")
 
-    async def _send_flow(
-        self, chat_id: str, content: str, reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """Отправка по одноразовому соединению, лимит ``reply_limit`` символов.
-
-        Companion-канал ноды фактически полудуплексный: на приёмной сессии
-        адаптера параллельно работают подписки/drain/auto-fetch, и send-команды
-        на ней стабильно голодают (no_event_received). Короткое выделенное
-        соединение для каждой отправки работает мгновенно (проверено) и не
-        зависит от состояния приёмной сессии. Слот уведомлений RX-сессия
-        возвращает себе плановой ротацией; накопленное добирается drain'ом.
-        """
-        text = (content or "").strip()
-        # повторная доставка реального ответа: снять ♻️-обёртку, доставить тело
-        text = _strip_recovery_marker(text)
+    async def _send_flow(self, chat_id: str, content: str) -> SendResult:
+        text = _strip_recovery_marker((content or "").strip())
         if not text:
             return SendResult(success=False, error="meshcore: empty message")
         if _is_service_message(text):
             logger.info("[%s] Dropping service notification (%d chars)", self.name, len(text))
             return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
         if len(text) > self._reply_limit:
-            logger.warning(
-                "[%s] Reply truncated from %d to %d chars (LoRa limit)",
-                self.name, len(text), self._reply_limit)
+            logger.warning("[%s] Reply truncated %d→%d", self.name, len(text), self._reply_limit)
             text = text[:self._reply_limit].rstrip()
-        # канальный адрес "chan:<idx>" — отправка в канал, контакт не нужен
+
         chan_idx: Optional[int] = None
         if chat_id.startswith("chan:"):
-            try:
+            with suppress(ValueError):
                 chan_idx = int(chat_id.split(":", 1)[1])
-            except ValueError:
+            if chan_idx is None:
                 return SendResult(success=False, error=f"meshcore: bad channel id '{chat_id}'")
 
-        result = None
-        mc = None
-        self._send_in_flight += 1
+        mc = await MeshCore.create_tcp(self._host, self._port)
+        mc.default_timeout = 15.0
         try:
-            mc = await MeshCore.create_tcp(self._host, self._port)
-            mc.default_timeout = 20.0
             await mc.connect()
-            with suppress(Exception):
-                await mc.ensure_contacts()
             if chan_idx is not None:
-                result = await asyncio.wait_for(
-                    mc.commands.send_chan_msg(chan_idx, text),
-                    timeout=CHANNEL_SEND_TIMEOUT_SECONDS + 5)
+                result = await mc.commands.send_chan_msg(chan_idx, text)
             else:
+                with suppress(Exception):
+                    await mc.ensure_contacts()
                 destination = None
                 with suppress(Exception):
                     destination = mc.get_contact_by_key_prefix(chat_id)
@@ -573,28 +337,17 @@ class MeshcoreAdapter(BasePlatformAdapter):
                         bytes.fromhex(chat_id)
                         destination = chat_id
                 if destination is None:
-                    return SendResult(success=False, error=f"meshcore: contact '{chat_id}' not found")
-                # РОВНО как проверенный рабочий путь (hermes send / standalone):
-                # один send_msg по свежему соединению. Никаких with_retry,
-                # flood-манипуляций и ожиданий ACK — они и теряли ответы.
-                result = await asyncio.wait_for(
-                    mc.commands.send_msg(destination, text),
-                    timeout=DM_SEND_TOTAL_SECONDS)
-        except asyncio.TimeoutError:
-            return SendResult(success=False, error="meshcore: send timed out (node not ACKing)")
-        except Exception as e:
-            return SendResult(success=False, error=f"meshcore send failed: {e}")
+                    return SendResult(
+                        success=False, error=f"meshcore: contact '{chat_id}' not found")
+                result = await mc.commands.send_msg(destination, text)
         finally:
-            self._send_in_flight = max(0, self._send_in_flight - 1)
-            if mc is not None:
-                with suppress(Exception):
-                    await mc.disconnect()
-        if result is None:
-            return SendResult(success=False, error="meshcore: send produced no result")
+            with suppress(Exception):
+                await mc.disconnect()
         if getattr(result, "type", None) == EventType.ERROR:
-            return SendResult(success=False, error=f"meshcore node error: {getattr(result, 'payload', None)}")
-        logger.info("[%s] Reply sent (%d chars, single plain send)",
-                    self.name, len(text), )
+            return SendResult(
+                success=False,
+                error=f"meshcore node error: {getattr(result, 'payload', None)}")
+        logger.info("[%s] Reply sent (%d chars)", self.name, len(text))
         return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
 
     async def send_typing(self, chat_id: str, **_kwargs) -> None:
@@ -611,8 +364,12 @@ class MeshcoreAdapter(BasePlatformAdapter):
 # -- Plugin registration -----------------------------------------------------
 
 
+def _parse_target_ref(target_ref: str):
+    ref = (target_ref or "").strip()
+    return (ref, None) if ref else None
+
+
 def _env_enablement() -> dict | None:
-    """``env_enablement_fn``: сидирует ``PlatformConfig.extra`` из env."""
     host = _get_scoped_secret("MESHCORE_HOST", "").strip()
     if not host:
         return None
@@ -633,36 +390,35 @@ def _env_enablement() -> dict | None:
 
 async def _standalone_send(
     pconfig, chat_id: str, message: str, *,
-    thread_id: Optional[str] = None, media_files: Optional[List[str]] = None,
+    thread_id: Optional[str] = None, media_files: Optional[list] = None,
     force_document: bool = False,
 ) -> Dict[str, Any]:
-    """Доставка вне процесса (cron / send_message_tool): короткое TCP-соединение.
-
-    ``thread_id``/``media_files`` — только совместимость сигнатуры (у MeshCore
-    нет тредов и вложений).
-    """
     if not MESHCORE_AVAILABLE:
         return send_error("meshcore standalone send: meshcore library not installed")
     extra = getattr(pconfig, "extra", {}) or {}
     host = _host_value(extra)
     if not host:
         return send_error("meshcore standalone send: MESHCORE_HOST not configured")
-    port, reply_limit = DEFAULT_PORT, DEFAULT_REPLY_LIMIT
     with suppress((TypeError, ValueError)):
         port = int(_extra_or_secret(extra, "port", "MESHCORE_PORT", DEFAULT_PORT))
     with suppress((TypeError, ValueError)):
-        reply_limit = int(_extra_or_secret(extra, "reply_limit", "MESHCORE_REPLY_LIMIT", DEFAULT_REPLY_LIMIT))
+        reply_limit = int(_extra_or_secret(
+            extra, "reply_limit", "MESHCORE_REPLY_LIMIT", DEFAULT_REPLY_LIMIT))
     home = extra.get("home_channel") if isinstance(extra.get("home_channel"), dict) else {}
     target = (chat_id or _get_scoped_secret("MESHCORE_HOME_CHANNEL", "").strip()
               or (home or {}).get("id") or "").strip()
     if not target:
-        return send_error("meshcore standalone send: no target contact (set MESHCORE_HOME_CHANNEL)")
-    text = (message or "").strip()[:reply_limit]
+        return send_error("meshcore standalone send: no target contact")
+    text = _strip_recovery_marker((message or "").strip())[:reply_limit]
     if not text:
         return send_error("meshcore standalone send: empty message")
     mc = None
     try:
-        mc = await _connect_with_contacts(host, port)
+        mc = await MeshCore.create_tcp(host, port)
+        mc.default_timeout = 15.0
+        await mc.connect()
+        with suppress(Exception):
+            await mc.ensure_contacts()
         destination = None
         with suppress(Exception):
             destination = mc.get_contact_by_name(target)
@@ -670,11 +426,9 @@ async def _standalone_send(
             with suppress(Exception):
                 destination = mc.get_contact_by_key_prefix(target)
         if destination is None:
-            try:
+            with suppress(ValueError):
                 bytes.fromhex(target)
                 destination = target
-            except ValueError:
-                destination = None
         if destination is None:
             return send_error(f"meshcore standalone send: contact '{target}' not found")
         await mc.commands.send_msg(destination, text)
@@ -688,24 +442,12 @@ async def _standalone_send(
                 await mc.disconnect()
 
 
-def _parse_target_ref(target_ref: str):
-    """``parse_target_ref_fn``: цель для ``hermes send -t meshcore:<ref>``.
-
-    Принимает как есть имя контакта или hex pubkey-префикс — реальный
-    резолвинг делает адаптер в ``send()`` (по префиксу, по имени, по ключу).
-    """
-    ref = (target_ref or "").strip()
-    if not ref:
-        return None
-    return ref, None
-
-
 def register(ctx) -> None:
-    """Точка входа плагина — вызывается плагиновой системой Hermes при старте."""
     ctx.register_platform(
         name="meshcore", label="meshcore",
         adapter_factory=lambda cfg: MeshcoreAdapter(cfg),
-        check_fn=check_requirements, validate_config=validate_config, is_connected=is_connected,
+        check_fn=check_requirements, validate_config=validate_config,
+        is_connected=is_connected,
         required_env=["MESHCORE_HOST"],
         install_hint="pip install meshcore",
         parse_target_ref_fn=_parse_target_ref,
@@ -714,12 +456,11 @@ def register(ctx) -> None:
         standalone_sender_fn=_standalone_send,
         allowed_users_env="MESHCORE_ALLOWED_USERS", allow_all_env="MESHCORE_ALLOW_ALL_USERS",
         max_message_length=DEFAULT_REPLY_LIMIT, emoji="📡",
-        pii_safe=False,  # в контактах возможны координаты
-        allow_update_command=True,
+        pii_safe=False, allow_update_command=True,
         platform_hint=(
             "You are communicating over MeshCore, a long-range low-bandwidth LoRa mesh "
             "radio network. Keep every reply under 130 characters of plain text — this is "
-            "a hard adapter-side limit, longer replies get truncated. No attachments, no "
-            "typing indicators; delivery can take tens of seconds. Reply in the user's "
-            "language; use weather emoji for weather answers."
+            "a hard adapter-side limit. No attachments, no typing indicators; delivery can "
+            "take tens of seconds. Reply in the user's language; use weather emoji for "
+            "weather answers."
         ))
